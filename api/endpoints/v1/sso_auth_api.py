@@ -187,6 +187,9 @@ async def sso_callback(
 
         user = existing_user
         logger.info(f"SSO login: {user.username}")
+        user.last_login = datetime.now(timezone.utc)   # NEW
+        session.add(user)
+        session.commit()
 
         jti = str(uuid_lib.uuid4())
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
