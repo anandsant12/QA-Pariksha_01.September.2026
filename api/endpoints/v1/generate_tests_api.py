@@ -1048,15 +1048,26 @@ async def generate_api_testcases_endpoint(
     if tc_type not in ("UAT", "SIT"):
         tc_type = "UAT"
 
+    # ── Route on API type — only EIS is implemented today ───────────────────
+    api_type = (request.api_type or "EIS").strip().upper()
+    if api_type != "EIS":
+        raise HTTPException(
+            400,
+            f"API type '{api_type}' is not available yet. Only 'EIS' is currently supported."
+        )
+
     spec = request.api_spec
     if not spec.payload:
         raise HTTPException(422, "The 'payload' object must contain at least one field.")
 
     payload_dict = {k: v.dict() for k, v in spec.payload.items()}
 
-    # ── Enforce mandatory fields / auto-inject defaults / derive RRN ────────
+    # ── Enforce mandatory fields / auto-inject defaults (per checkbox selection) / derive RRN ─
     try:
-        payload_dict, generated_rrn = apply_mandatory_fields(payload_dict)
+        payload_dict, generated_rrn = apply_mandatory_fields(
+            payload_dict,
+            include_fields=request.mandatory_fields_to_include,
+        )
     except ValueError as e:
         raise HTTPException(422, str(e))
 
