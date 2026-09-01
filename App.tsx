@@ -51,8 +51,7 @@ const TF_COLUMNS = [
 // ============================================================================
 // API
 // ============================================================================
-// const API_BASE = 'http://localhost:1000/api/v1/testcase-generation';
-import { API_BASE } from './config';
+const API_BASE = 'http://localhost:1000/api/v1/testcase-generation';
 
 // ============================================================================
 // TYPES
@@ -148,12 +147,32 @@ const SAMPLE_API_JSON = {
     },
 };
 
-export const generateApiTestCases = async (apiSpec: ApiSpec, userPrompt: string): Promise<ApiTestCaseResult> => {
+const API_TYPE_OPTIONS: { value: string; label: string; enabled: boolean }[] = [
+    { value: 'EIS',      label: 'EIS',                 enabled: true },
+    { value: 'OPTION_2', label: 'Option 2 (Coming Soon)', enabled: false },
+    { value: 'OPTION_3', label: 'Option 3 (Coming Soon)', enabled: false },
+];
+
+const MANDATORY_FIELD_OPTIONS = ['REQUEST_AUTH_ID', 'REQUEST_TELLER_ID', 'BRANCH_CODE'] as const;
+type MandatoryFieldFlags = Record<typeof MANDATORY_FIELD_OPTIONS[number], boolean>;
+
+
+export const generateApiTestCases = async (
+    apiSpec: ApiSpec,
+    userPrompt: string,
+    apiType: string,
+    mandatoryFieldsToInclude: string[],
+): Promise<ApiTestCaseResult> => {
     const res = await fetch(`${API_BASE}/generate-api-testcases`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'include',
-        body: JSON.stringify({ api_spec: apiSpec, user_prompt: userPrompt || null }),
+        body: JSON.stringify({
+            api_spec: apiSpec,
+            user_prompt: userPrompt || null,
+            api_type: apiType,
+            mandatory_fields_to_include: mandatoryFieldsToInclude,
+        }),
     });
     if (!res.ok) throw new Error((await res.json()).detail || 'API test case generation failed');
     return res.json();
@@ -212,7 +231,11 @@ const ApiJsonUpload: React.FC<{
     apiSpec: ApiSpec | null;
     onParsed: (spec: ApiSpec) => void;
     onClear: () => void;
-}> = ({ apiSpec, onParsed, onClear }) => {
+    apiType: string;
+    onApiTypeChange: (t: string) => void;
+    mandatoryFields: MandatoryFieldFlags;
+    onMandatoryFieldsChange: (f: MandatoryFieldFlags) => void;
+}> = ({ apiSpec, onParsed, onClear, apiType, onApiTypeChange, mandatoryFields, onMandatoryFieldsChange }) => {
     const [error, setError] = useState('');
     const [fileName, setFileName] = useState('');
 
@@ -251,6 +274,40 @@ const ApiJsonUpload: React.FC<{
 
     return (
         <Box>
+            <Box sx={{ mb: 2 }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.75 }}>API Under Test</Typography>
+                <FormControl fullWidth size="small">
+                    <Select value={apiType} onChange={e => onApiTypeChange(e.target.value)}>
+                        {API_TYPE_OPTIONS.map(opt => (
+                            <MenuItem key={opt.value} value={opt.value} disabled={!opt.enabled}>
+                                {opt.label}
+                            </MenuItem>
+                        ))}
+                    </Select>
+                </FormControl>
+            </Box>
+
+            <Box sx={{ mb: 2 }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                    Auto-fill mandatory fields (if missing)
+                </Typography>
+                <FormGroup>
+                    {MANDATORY_FIELD_OPTIONS.map(field => (
+                        <FormControlLabel
+                            key={field}
+                            control={
+                                <Checkbox
+                                    size="small"
+                                    checked={mandatoryFields[field]}
+                                    onChange={e => onMandatoryFieldsChange({ ...mandatoryFields, [field]: e.target.checked })}
+                                />
+                            }
+                            label={<Typography variant="caption">{field}</Typography>}
+                        />
+                    ))}
+                </FormGroup>
+            </Box>
+
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
                 <Typography variant="h6" sx={{ fontWeight: 600, flex: 1 }}>Upload API JSON Spec</Typography>
             </Box>
@@ -280,11 +337,19 @@ const ApiJsonUpload: React.FC<{
                             </Typography>
                         </Alert>
                     )}
-                    {(['REQUEST_AUTH_ID', 'REQUEST_TELLER_ID', 'BRANCH_CODE'] as const).some(f => !(f in apiSpec.payload)) && (
+                    {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && mandatoryFields[f]).length > 0 && (
                         <Alert severity="info" sx={{ mb: 1.5, py: 0.5 }}>
                             <Typography variant="caption">
-                                REQUEST_AUTH_ID / REQUEST_TELLER_ID / BRANCH_CODE — any missing ones will be
-                                auto-filled with standard default values.
+                                {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && mandatoryFields[f]).join(' / ')}
+                                {' '}— missing, will be auto-filled with standard default values (per your checkbox selection above).
+                            </Typography>
+                        </Alert>
+                    )}
+                    {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && !mandatoryFields[f]).length > 0 && (
+                        <Alert severity="warning" sx={{ mb: 1.5, py: 0.5 }}>
+                            <Typography variant="caption">
+                                {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && !mandatoryFields[f]).join(' / ')}
+                                {' '}— missing and unticked, will NOT be added to the payload.
                             </Typography>
                         </Alert>
                     )}
@@ -2089,6 +2154,11 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
     const isAdmin        = user.role === 'admin';
     const testcaseClient = (user.testcase_client || 'UAT').toUpperCase();
 
+    const [apiType, setApiType] = useState<string>('EIS');
+    const [mandatoryFields, setMandatoryFields] = useState<MandatoryFieldFlags>({
+        REQUEST_AUTH_ID: true, REQUEST_TELLER_ID: true, BRANCH_CODE: true,
+    });
+
     // ── Document-mode generation ─────────────────────────────────────────────
     const handleGenerate = async (prompt: string, selectedCheckboxes: string[]) => {
         if (!pdfData) { alert('Upload a document first'); return; }
@@ -2114,19 +2184,24 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
         if (!apiSpec) return;
         setApiLoading(true);
         try {
-            const res = await generateApiTestCases(apiSpec, apiUserPrompt);
+            const selectedFields = MANDATORY_FIELD_OPTIONS.filter(f => mandatoryFields[f]);
+            const res = await generateApiTestCases(apiSpec, apiUserPrompt, apiType, selectedFields);
             setApiResult(res);
         } catch (err: any) { alert('Error: ' + (err.message || 'API test case generation failed')); }
         finally { setApiLoading(false); }
     };
 
-    const handleClearApiSpec = () => { setApiSpec(null); setApiResult(null); };
+    const handleClearApiSpec = () => {
+        setApiSpec(null); setApiResult(null);
+        setMandatoryFields({ REQUEST_AUTH_ID: true, REQUEST_TELLER_ID: true, BRANCH_CODE: true });
+    };
 
     // ── Switch back to mode-selection screen, clearing both flows ───────────
     const handleSwitchMode = () => {
         setMode(null);
         setPdfData(null); setResult(null); setUserPrompt('');
         setApiSpec(null); setApiResult(null); setApiUserPrompt('');
+        setMandatoryFields({ REQUEST_AUTH_ID: true, REQUEST_TELLER_ID: true, BRANCH_CODE: true })
     };
 
     // ── Sidebar resize (unchanged) ───────────────────────────────────────────
@@ -2244,6 +2319,10 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
                                     apiSpec={apiSpec}
                                     onParsed={spec => { setApiSpec(spec); setApiResult(null); }}
                                     onClear={handleClearApiSpec}
+                                    apiType={apiType}
+                                    onApiTypeChange={setApiType}
+                                    mandatoryFields={mandatoryFields}
+                                    onMandatoryFieldsChange={setMandatoryFields}
                                 />
                             ) : (
                                 <Box sx={{ p: 1 }}>
