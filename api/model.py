@@ -38,6 +38,7 @@ class User(UserBase, table=True):
     disabled: bool = Field(default=False)
     must_change_password: bool = Field(default=False)
     login_count: int = Field(default=0)
+    last_login: Optional[datetime] = Field(default=None, index=True)
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -51,6 +52,7 @@ class UserResponse(UserBase):
     disabled: bool
     must_change_password: bool
     login_count: int
+    last_login: Optional[datetime] = None 
     created_at: datetime
 
 
