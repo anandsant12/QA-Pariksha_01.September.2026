@@ -87,25 +87,31 @@ def _baseline_value(field_spec: Dict[str, Any]) -> Any:
     return _field_values(field_spec)[0]
 
 
-def apply_mandatory_fields(payload: Dict[str, Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], Optional[str]]:
-    """
-    - Auto-injects REQUEST_AUTH_ID / REQUEST_TELLER_ID / BRANCH_CODE with defaults
-      if any of them is missing from the input payload (each checked independently).
-    - Raises ValueError if SOURCE_ID is missing — this is a hard requirement.
-    - REQUEST_REFERENCE_NUMBER (RRN):
-        * If the user already provided it in the input payload -> leave it exactly
-          as given, it stays a normal payload field and appears in every Test Data.
-        * If the user did NOT provide it -> generate it via make_rrn(SOURCE_ID) for
-          reference only. It is NOT added to the payload, so it will NOT appear as
-          a key in the generated Test Data for any test case.
+def apply_mandatory_fields(
+    payload: Dict[str, Dict[str, Any]],
+    include_fields: Optional[List[str]] = None,
+) -> tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """
+    - Auto-injects REQUEST_AUTH_ID / REQUEST_TELLER_ID / BRANCH_CODE with defaults
+      if any of them is missing from the input payload — but ONLY for the field
+      names present in `include_fields`. Each checked independently.
+    - `include_fields=None` (default) means "inject all three if missing" — this
+      matches the UI checkboxes being ticked ON by default. Pass an explicit list
+      (e.g. from the UI's unticked checkboxes) to skip specific fields entirely —
+      an unticked field will NOT be added even if missing from the payload.
+    ...
+    Returns: (payload_with_mandatory_fields, generated_rrn_or_None)
+    """
+    payload = dict(payload)  # shallow copy — don't mutate the caller's dict
 
-    Returns: (payload_with_mandatory_fields, generated_rrn_or_None)
-    """
-    payload = dict(payload)  # shallow copy — don't mutate the caller's dict
+    fields_to_inject = (
+        set(MANDATORY_DEFAULT_FIELDS.keys()) if include_fields is None
+        else set(include_fields) & set(MANDATORY_DEFAULT_FIELDS.keys())
+    )
 
-    for field_name, default_spec in MANDATORY_DEFAULT_FIELDS.items():
-        if field_name not in payload:
-            payload[field_name] = dict(default_spec)
+    for field_name in fields_to_inject:
+        if field_name not in payload:
+            payload[field_name] = dict(MANDATORY_DEFAULT_FIELDS[field_name])
 
     source_spec = payload.get(SOURCE_ID_FIELD)
     if not source_spec or _baseline_value(source_spec) in (None, ""):
