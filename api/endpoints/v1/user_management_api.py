@@ -131,6 +131,7 @@ async def login(login_data: LoginRequest, request: Request, response: Response, 
         clear_failed_attempts(ip_key, session)
 
         user.login_count = (user.login_count or 0) + 1
+        user.last_login  = datetime.now(timezone.utc)
         session.add(user)
         session.commit()
         session.refresh(user)
@@ -392,23 +393,41 @@ async def delete_user_by_admin(
         raise HTTPException(500, str(e))
 
 
-@user_management_router.get("/admin/users-list", include_in_schema=False)
-async def list_all_users_by_admin(
+@user_management_router.get("/admin/inactive-users", include_in_schema=False)
+async def get_inactive_users(
     session: SessionDep,
     admin_user: Annotated[User, Depends(get_current_admin_user)],
+    days: int = 60,   # 60 or 90, passed as ?days=90 from the frontend
 ):
-    users = session.exec(select(User).order_by(User.created_at.desc())).all()
+    from datetime import timedelta
+    if days not in (60, 90):
+        raise HTTPException(400, "days must be 60 or 90")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    users = session.exec(select(User)).all()
+
+    inactive = []
+    for u in users:
+        last = u.last_login
+        if last and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        if last is None or last < cutoff:
+            inactive.append(u)
+
     return {
-        "total_users": len(users),
+        "days_threshold": days,
+        "cutoff_date": cutoff.isoformat(),
+        "total_inactive": len(inactive),
         "users": [
             {
-                "id": u.id, "first_name": u.first_name, "last_name": u.last_name,
-                "username": u.username, "email": u.email, "departmentid": u.departmentid,
-                "role": u.role, "is_active": u.is_active, "disabled": u.disabled,
-                "testcase_client": u.testcase_client,   # NEW
-                "application_name" : u.application_name or "",
-                "created_at": u.created_at, "updated_at": u.updated_at,
+                "id": u.id, "username": u.username, "email": u.email,
+                "first_name": u.first_name, "last_name": u.last_name,
+                "departmentid": u.departmentid, "role": u.role,
+                "is_active": u.is_active, "disabled": u.disabled,
+                "last_login": u.last_login.isoformat() if u.last_login else None,
+                "login_count": u.login_count or 0,
+                "created_at": u.created_at.isoformat() if u.created_at else "",
             }
-            for u in users
+            for u in inactive
         ],
     }
