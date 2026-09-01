@@ -31,7 +31,9 @@ import * as XLSX from 'xlsx';
 // CONSTANTS
 // ============================================================================
 
-const API_BASE = 'http://localhost:1000/api/v1/testcase-generation';
+// const API_BASE = 'http://localhost:1000/api/v1/testcase-generation';
+
+import { API_BASE } from '../config';
 
 const MAX_INGEST_MB = 70;
 
@@ -1084,6 +1086,92 @@ const ActivityDashboardPanel: React.FC = () => {
     );
 };
 
+const InactiveUsersPanel: React.FC = () => {
+    const [days, setDays]         = useState<60 | 90>(60);
+    const [data, setData]         = useState<any>(null);
+    const [loading, setLoading]   = useState(false);
+    const [error, setError]       = useState('');
+
+    const fetchInactive = async () => {
+        setLoading(true); setError('');
+        try {
+            const res = await fetch(`${API_BASE}/admin/inactive-users?days=${days}`, { credentials: 'include' });
+            if (!res.ok) throw new Error((await res.json()).detail || 'Failed to fetch');
+            setData(await res.json());
+        } catch (err: any) { setError(err.message); }
+        finally { setLoading(false); }
+    };
+
+    const disableUser = async (username: string) => {
+        if (!window.confirm(`Disable account for ${username}?`)) return;
+        try {
+            const res = await fetch(`${API_BASE}/admin/users/${username}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ is_active: 0 }),
+            });
+            if (!res.ok) throw new Error((await res.json()).detail || 'Failed to disable');
+            fetchInactive();
+        } catch (err: any) { setError(err.message); }
+    };
+
+    return (
+        <Box>
+            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 2 }}>
+                <FormControl size="small" sx={{ minWidth: 140 }}>
+                    <InputLabel>Inactive for</InputLabel>
+                    <Select value={days} label="Inactive for" onChange={e => setDays(Number(e.target.value) as 60 | 90)}>
+                        <MenuItem value={60}>60 days</MenuItem>
+                        <MenuItem value={90}>90 days</MenuItem>
+                    </Select>
+                </FormControl>
+                <Button variant="contained" onClick={fetchInactive} disabled={loading}>
+                    {loading ? <CircularProgress size={20} /> : 'Check'}
+                </Button>
+            </Box>
+            {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+            {data && (
+                <>
+                    <Typography variant="body2" sx={{ mb: 1 }}>
+                        {data.total_inactive} user(s) inactive since before {new Date(data.cutoff_date).toLocaleDateString()}
+                    </Typography>
+                    <TableContainer component={Paper}>
+                        <Table size="small">
+                            <TableHead>
+                                <TableRow>
+                                    <TableCell>Username</TableCell><TableCell>Name</TableCell>
+                                    <TableCell>Email</TableCell><TableCell>Last Login</TableCell>
+                                    <TableCell>Status</TableCell><TableCell>Action</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {data.users.map((u: any) => (
+                                    <TableRow key={u.username}>
+                                        <TableCell>{u.username}</TableCell>
+                                        <TableCell>{u.first_name} {u.last_name}</TableCell>
+                                        <TableCell>{u.email}</TableCell>
+                                        <TableCell>{u.last_login ? new Date(u.last_login).toLocaleString() : 'Never'}</TableCell>
+                                        <TableCell>{u.disabled ? <Chip label="Disabled" size="small" color="default" /> : <Chip label="Active" size="small" color="success" />}</TableCell>
+                                        <TableCell>
+                                            {!u.disabled && (
+                                                <Button size="small" color="error" onClick={() => disableUser(u.username)}>
+                                                    Disable
+                                                </Button>
+                                            )}
+                                        </TableCell>
+                                    </TableRow>
+                                ))}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+                </>
+            )}
+        </Box>
+    );
+};
+
+
 // ============================================================================
 // MAIN ADMIN PANEL
 // ============================================================================
@@ -1358,7 +1446,21 @@ const AdminPanel: React.FC = () => {
                     </Accordion>
                 </CardContent>
             </Card>
-
+            
+            {/* ════════════════════════════════════════════════════════════════
+                ACTIVITY DASHBOARD
+            ════════════════════════════════════════════════════════════════ */}
+            <Card sx={{ ...ragCard, mb: 3 }}>
+                <CardContent>
+                    <Accordion sx={{ mt: 2 }}>
+                        <AccordionSummary expandIcon={<ExpandMore />}>
+                            <Typography variant="h6" sx={{ fontWeight: 600 }}>Inactive Users</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails><InactiveUsersPanel /></AccordionDetails>
+                    </Accordion>    
+                </CardContent>
+            </Card>
+            
             {/* ════════════════════════════════════════════════════════════════
                 SEARCH USER
             ════════════════════════════════════════════════════════════════ */}
