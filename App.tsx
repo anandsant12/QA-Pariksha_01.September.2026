@@ -29,7 +29,9 @@ import AdminPanel from './components/AdminPanel';
 // CONFIGURATION
 // ============================================================================
 const ENABLE_REGISTER_TAB = false;
-const GENERATE_FEATURE_FILE = false;  
+const GENERATE_FEATURE_FILE = false;
+const SHOW_API_TYPE_DROPDOWN = false;              
+const SHOW_MANDATORY_FIELD_CHECKBOXES = false;      
 
 // Columns to hide from the results table (lowercase keys as they appear in JSON)
 const HIDDEN_RESULT_COLUMNS = new Set(['document_name', 'Document Name']);
@@ -276,39 +278,43 @@ const ApiJsonUpload: React.FC<{
 
     return (
         <Box>
-            <Box sx={{ mb: 2 }}>
-                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.75 }}>API Under Test</Typography>
-                <FormControl fullWidth size="small">
-                    <Select value={apiType} onChange={e => onApiTypeChange(e.target.value)}>
-                        {API_TYPE_OPTIONS.map(opt => (
-                            <MenuItem key={opt.value} value={opt.value} disabled={!opt.enabled}>
-                                {opt.label}
-                            </MenuItem>
-                        ))}
-                    </Select>
-                </FormControl>
-            </Box>
+            {SHOW_API_TYPE_DROPDOWN && (
+                <Box sx={{ mb: 2 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.75 }}>API Under Test</Typography>
+                    <FormControl fullWidth size="small">
+                        <Select value={apiType} onChange={e => onApiTypeChange(e.target.value)}>
+                            {API_TYPE_OPTIONS.map(opt => (
+                                <MenuItem key={opt.value} value={opt.value} disabled={!opt.enabled}>
+                                    {opt.label}
+                                </MenuItem>
+                            ))}
+                        </Select>
+                    </FormControl>
+                </Box>
+            )}
 
-            <Box sx={{ mb: 2 }}>
-                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
-                    Auto-fill mandatory fields (if missing)
-                </Typography>
-                <FormGroup>
-                    {MANDATORY_FIELD_OPTIONS.map(field => (
-                        <FormControlLabel
-                            key={field}
-                            control={
-                                <Checkbox
-                                    size="small"
-                                    checked={mandatoryFields[field]}
-                                    onChange={e => onMandatoryFieldsChange({ ...mandatoryFields, [field]: e.target.checked })}
-                                />
-                            }
-                            label={<Typography variant="caption">{field}</Typography>}
-                        />
-                    ))}
-                </FormGroup>
-            </Box>
+            {SHOW_MANDATORY_FIELD_CHECKBOXES && (
+                <Box sx={{ mb: 2 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                        Auto-fill mandatory fields (if missing)
+                    </Typography>
+                    <FormGroup>
+                        {MANDATORY_FIELD_OPTIONS.map(field => (
+                            <FormControlLabel
+                                key={field}
+                                control={
+                                    <Checkbox
+                                        size="small"
+                                        checked={mandatoryFields[field]}
+                                        onChange={e => onMandatoryFieldsChange({ ...mandatoryFields, [field]: e.target.checked })}
+                                    />
+                                }
+                                label={<Typography variant="caption">{field}</Typography>}
+                            />
+                        ))}
+                    </FormGroup>
+                </Box>
+            )}
 
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, mb: 2 }}>
                 <Typography variant="h6" sx={{ fontWeight: 600, flex: 1 }}>Upload API JSON Spec</Typography>
@@ -2186,8 +2192,11 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
         if (!apiSpec) return;
         setApiLoading(true);
         try {
-            const selectedFields = MANDATORY_FIELD_OPTIONS.filter(f => mandatoryFields[f]);
-            const res = await generateApiTestCases(apiSpec, apiUserPrompt, apiType, selectedFields);
+            const effectiveApiType = SHOW_API_TYPE_DROPDOWN ? apiType : 'EIS';
+            const selectedFields = SHOW_MANDATORY_FIELD_CHECKBOXES
+                ? MANDATORY_FIELD_OPTIONS.filter(f => mandatoryFields[f])
+                : [...MANDATORY_FIELD_OPTIONS]; // toggle off => always all 3, exactly like before
+            const res = await generateApiTestCases(apiSpec, apiUserPrompt, effectiveApiType, selectedFields);
             setApiResult(res);
         } catch (err: any) { alert('Error: ' + (err.message || 'API test case generation failed')); }
         finally { setApiLoading(false); }
