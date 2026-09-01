@@ -265,6 +265,8 @@ class RunApiTestcasesRequest(BaseModel):
 class APITestCaseGenerateRequest(BaseModel):
     api_spec: APITestCaseSpec
     user_prompt: Optional[str] = None
+    api_type: Optional[str] = "EIS"                            # NEW — which API integration to use
+    mandatory_fields_to_include: Optional[List[str]] = None    # NEW — checkbox selections from UI
 
 
 
