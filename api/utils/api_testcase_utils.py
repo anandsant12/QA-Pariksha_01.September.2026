@@ -278,6 +278,35 @@ def _sanitize_positive_testcases(
     return testcases
 
 
+def _assign_unique_rrns(
+    testcases: List[Dict[str, Any]],
+    baseline_rrn: str,
+    source_id: str,
+) -> List[Dict[str, Any]]:
+    """
+    Whenever the user supplies REQUEST_REFERENCE_NUMBER in the input payload, the
+    LLM (correctly, per rule 3 — vary only one field per test case) carries that
+    SAME literal value into every test case's Test Data. Left as-is, every row
+    would end up with an IDENTICAL RRN, which the target banking API rejects as a
+    duplicate/non-unique reference number once test cases are actually executed.
+
+    This gives every test case its OWN unique RRN (same "SBI"+SOURCE_ID prefix,
+    fresh random suffix, still 25 chars total) — EXCEPT test cases where the LLM
+    deliberately mutated the RRN itself to build a negative test case FOR the RRN
+    field (its value no longer matches the original baseline). Those are left
+    untouched — overwriting them would silently defeat that specific negative test.
+    """
+    for tc in testcases:
+        td = tc.get("Test Data")
+        if not isinstance(td, dict) or RRN_FIELD not in td:
+            continue
+        current_val = str(td[RRN_FIELD])
+        if current_val == str(baseline_rrn):
+            # Untouched by the LLM -> safe to give this row its own unique RRN.
+            td[RRN_FIELD] = make_rrn(source_id)
+        # else: LLM intentionally broke this field for a negative test -> leave as-is.
+    return testcases
+
 def generate_api_testcases_via_llm(
     api_name: str,
     api_url: str,
@@ -351,6 +380,13 @@ def generate_api_testcases_via_llm(
                 raise ValueError("No valid test cases parsed from LLM response")
 
             cleaned = _sanitize_positive_testcases(cleaned, payload)
+            rrn_spec = payload.get(RRN_FIELD)
+            if rrn_spec:
+                baseline_rrn = _baseline_value(rrn_spec)
+                source_spec  = payload.get(SOURCE_ID_FIELD)
+                if baseline_rrn not in (None, "") and source_spec:
+                    source_id_value = str(_baseline_value(source_spec))
+                    cleaned = _assign_unique_rrns(cleaned, baseline_rrn, source_id_value)
 
             # Re-number IDs sequentially after sanitization (order unchanged, just clarity)
             for i, tc in enumerate(cleaned, start=1):
