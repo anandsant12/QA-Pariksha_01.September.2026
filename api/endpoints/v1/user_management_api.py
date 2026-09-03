@@ -431,3 +431,37 @@ async def get_inactive_users(
             for u in inactive
         ],
     }
+
+
+@user_management_router.get("/admin/users-list", include_in_schema=False)
+async def list_all_users_by_admin(
+    session: SessionDep,
+    admin_user: Annotated[User, Depends(get_current_admin_user)],
+):
+    try:
+        users = session.exec(select(User).order_by(User.created_at.desc())).all()
+        return {
+            "total": len(users),
+            "users": [
+                {
+                    "id": u.id,
+                    "username": u.username,
+                    "email": u.email,
+                    "first_name": u.first_name,
+                    "last_name": u.last_name,
+                    "departmentid": u.departmentid,
+                    "role": u.role,
+                    "is_active": u.is_active,
+                    "disabled": u.disabled,
+                    "must_change_password": u.must_change_password,
+                    "testcase_client": u.testcase_client,
+                    "application_name": u.application_name,
+                    "login_count": u.login_count or 0,
+                    "last_login": u.last_login.isoformat() if u.last_login else None,
+                    "created_at": u.created_at.isoformat() if u.created_at else "",
+                }
+                for u in users
+            ],
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
