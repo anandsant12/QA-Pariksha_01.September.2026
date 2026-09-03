@@ -52,15 +52,19 @@ RRN_PREFIX = "SBI"
 # Running sequence number (NNNNNN) — process-local, thread-safe, wraps at 999999.
 _rrn_sequence_lock = threading.Lock()
 _rrn_sequence_counter = 0
+_RRN_SEQUENCE_MULTIPLIER = 400223  # must stay coprime with 1_000_000 (not divisible by 2 or 5)
 
 
 def _next_sequence_number() -> str:
-    """Thread-safe running sequence number, 6 digits, wraps 999999 -> 000000."""
+    """Thread-safe running sequence number, 6 digits. Collision-free across a
+    full 1,000,000-call cycle (same guarantee as a plain counter), but scrambled
+    so consecutive calls don't look sequential."""
     global _rrn_sequence_counter
     with _rrn_sequence_lock:
         _rrn_sequence_counter = (_rrn_sequence_counter + 1) % 1_000_000
-        seq = _rrn_sequence_counter
-    return f"{seq:06d}"
+        counter = _rrn_sequence_counter
+    scrambled = (counter * _RRN_SEQUENCE_MULTIPLIER) % 1_000_000
+    return f"{scrambled:06d}"
 
 
 def make_rrn(source_id: str) -> str:
