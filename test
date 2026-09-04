@@ -1,3 +1,175 @@
-SBIUZ26246153255911000009
-SBIUZ26246153255911000010
-SBIUZ26246153255911000011
+
+So we have completed API automation testcase for this EIS now
+Now there are two more api test types : EIS Channel and EIS Microservices. 
+You can add these values inthat dropdown where we select which api type we need to test. 
+
+So for these two api types we need different approach. 
+
+Input json for these api types will be different than what we provided in normal EIS api type mode. 
+so : SOURCE_ID,DESTINATION,TXN_TYPE,TXN_SUB_TYPE,REQUEST_REFERENCE_NUMBER,EIS_PAYLOAD
+{
+  "api_name": "",
+  "api_url": "",
+  "method": "POST",
+  "payload": {
+    "SOURCE_ID": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "DESTINATION": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "TXN_TYPE": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "TXN_SUB_TYPE": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "REQUEST_REFERENCE_NUMBER": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "EIS_PAYLOAD": {
+      "value": {
+                  "mobile_number": {
+                    "value": "",
+                    "required": true,
+                    "validation": ""
+                  },
+                  "pan_number": {
+                    "value": "",
+                    "required": false,
+                    "validation": ""
+                  }  
+               },
+      "required": true,
+      "validation": ""
+    }
+
+  }
+}
+
+this is how input will be. In this SOURCE_ID,DESTINATION,TXN_TYPE,TXN_SUB_TYPE,REQUEST_REFERENCE_NUMBER,EIS_PAYLOAD these 6 parameters will be there 
+i dont know about REQUEST_REFERENCE_NUMBER but rest 5 are compulsory parameters.
+so in this EIS_PAYLOAD  , the value is nothing but similar to our previous value of "payload" key from the normal eis api type mode.
+so for testcase generation we will be primararily generating testcase for EIS_PAYLOAD key like altering the values of keys which are present in EIS_PAYLOAD on 
+the basis of validations provided for that particular key. So at a time we need to generate testcase by alterinng value of single key keeping the rest values same and the parent 
+keys will be as it is which as SOURCE_ID,DESTINATION,TXN_TYPE,TXN_SUB_TYPE,REQUEST_REFERENCE_NUMBER. So all encryption decryption while actually hitting the eis api will be same 
+previously in normal eis type api we are encrypting such kind of payload :
+
+{
+        "username": "",
+        "password": "==",
+        "merchantType": "",
+        "merchantName": ")",
+        "amount": ""
+    }
+
+but now we will need to encrypt  payload which will look like :{
+    "EIS_PAYLOAD": {
+        "username": "",
+        "password": "==",
+        "merchantType": "",
+        "merchantName": ")",
+        "amount": ""
+    },
+    "SOURCE_ID": "",
+    "DESTINATION": "",
+    "TXN_TYPE": "",
+    "TXN_SUB_TYPE": "",
+    "REQUEST_REFERENCE_NUMBER": ""
+}
+
+and create final payload as :
+{
+    "REQUEST_REFERENCE_NUMBER": "",
+    "DIGI_SIGN": "YlvtA==",
+    "REQUEST": "DVy37vEc7hJ6e/JFsm"
+}
+
+and then hit the api. So these are same as previous just i am letting you know. 
+
+
+also there might be chances that json can be like :
+{
+  "api_name": "",
+  "api_url": "",
+  "method": "POST",
+  "payload": {
+    "SOURCE_ID": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "DESTINATION": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "TXN_TYPE": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "TXN_SUB_TYPE": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "REQUEST_REFERENCE_NUMBER": {
+      "value": "",
+      "required": true,
+      "validation": ""
+    },    
+    "EIS_PAYLOAD": {
+      "value":
+      { 
+        "HEADERS": {
+            "Accept-Language": "eng",
+            "X-Correlation-Id": "019ed939-84d7-71aa-b444-4b9eb297b217",
+            "X-API-Version": "1"
+                    },
+        "BODY":  {
+                  "mobile_number": {
+                    "value": "",
+                    "required": true,
+                    "validation": ""
+                  },
+                  "pan_number": {
+                    "value": "",
+                    "required": false,
+                    "validation": ""
+                  }
+                }
+        },
+      "required": true,
+      "validation": ""
+    }
+
+  }
+}
+
+
+so if this is the case then we will need to check for the BODY key and inside body there are our keys values and validation on which we 
+will generate testcase. and then test them accordingly by following the payload structure.
+
+also You know RRN in {
+    "REQUEST_REFERENCE_NUMBER": "",
+    "DIGI_SIGN": "YlvtA==",
+    "REQUEST": "DVy37vEc7hJ6e/JFsm"
+} should be same as RRN in out encrypted payload right so dont forgot that.
+
+one more change :
+when user uploads a json file i shoiuld be able to see the parent keys and values and those should be editable so that if i want suppose to check in different DESTINATION
+i should be able to update value from the UI only. 
+So this is work around for our both API TYPES EIS CHANNEL and EIS MICRO SERVICES. 
+please generate code and let me know the changes. Also let me know what are your thoughs or ideas or any suggestions , i am open for them. 
+Generate and tell me what to replace with what , you can create new file for this 
