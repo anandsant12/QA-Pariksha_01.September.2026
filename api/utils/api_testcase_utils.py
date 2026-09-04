@@ -304,6 +304,67 @@ def wrap_testcases_in_eis_container(
     return wrapped
 
 
+def build_eis_payload_baseline(
+    testable_fields: Dict[str, Dict[str, Any]],
+    headers: Optional[Dict[str, Any]],
+    headers_key: Optional[str],
+    body_key: str,
+) -> Any:
+    """The "true" EIS_PAYLOAD value exactly as given in the input JSON — every
+    field at its baseline (first/default) value, rebuilt in whichever shape
+    (flat, or {HEADERS, BODY}) the input used. Used to hold EIS_PAYLOAD fixed
+    while parent-key test cases vary SOURCE_ID / DESTINATION / TXN_TYPE /
+    TXN_SUB_TYPE instead."""
+    baseline_fields = {f: _baseline_value(spec) for f, spec in testable_fields.items()}
+    if headers_key is not None:
+        return {headers_key: (headers or {}), body_key: baseline_fields}
+    return baseline_fields
+
+
+def _is_full_baseline(test_data: Any, fields: Dict[str, Dict[str, Any]]) -> bool:
+    """True if every field in test_data matches its baseline (first/default)
+    value — i.e. this is the "everything correct" case. Used to drop the
+    parent-field batch's own baseline-positive test case, since that exact
+    scenario (everything at baseline, including EIS_PAYLOAD) is already
+    produced once by the EIS_PAYLOAD-variation batch — no need to duplicate it."""
+    if not isinstance(test_data, dict):
+        return False
+    for field, spec in fields.items():
+        if field not in test_data:
+            return False
+        if str(test_data.get(field)) != str(_baseline_value(spec)):
+            return False
+    return True
+
+
+def wrap_parent_field_testcases(
+    testcases: List[Dict[str, Any]],
+    eis_payload_baseline: Any,
+    source_id_for_rrn: str,
+) -> List[Dict[str, Any]]:
+    """
+    Rebuilds every generated "parent field" test case's Test Data: whichever
+    subset of {SOURCE_ID, DESTINATION, TXN_TYPE, TXN_SUB_TYPE} the LLM produced
+    for THIS test case (exactly one deliberately varied or removed, per the
+    usual one-field-at-a-time rule) is used as-is, EIS_PAYLOAD is fixed at its
+    baseline ("true") value from the input JSON, and every test case gets a
+    fresh unique REQUEST_REFERENCE_NUMBER generated from the ORIGINAL valid
+    SOURCE_ID — not whatever value is under test in that row, since a
+    deliberately missing/malformed SOURCE_ID test case still needs a
+    well-formed RRN for the call to actually reach the API.
+    """
+    wrapped: List[Dict[str, Any]] = []
+    for tc in testcases:
+        parent_td = dict(tc.get("Test Data") or {})
+        full_td = {
+            **parent_td,
+            RRN_FIELD: make_rrn(source_id_for_rrn),
+            EIS_PAYLOAD_FIELD: eis_payload_baseline,
+        }
+        wrapped.append({**tc, "Test Data": full_td})
+    return wrapped
+
+
 API_TESTCASE_SYSTEM_PROMPT = """You are an expert API test analyst for a banking application (State Bank of India).
 You generate POSITIVE and NEGATIVE test cases for a SINGLE REST API from a payload
 specification that gives, for every field: its correct value(s), whether it is
@@ -549,6 +610,58 @@ def generate_api_testcases_via_llm(
             print(f"    ✗ Attempt {attempt} failed: {e}")
 
     raise RuntimeError(f"API test case generation failed after {max_retries} attempts: {last_error}")
+
+
+# ============================================================================
+# EIS Channel / EIS Microservices — parent-key variation batch
+# ============================================================================
+
+def generate_parent_field_testcases(
+    api_name: str,
+    api_url: str,
+    method: str,
+    payload: Dict[str, Dict[str, Any]],
+    eis_payload_baseline: Any,
+    source_id_for_rrn: str,
+    user_prompt: Optional[str] = None,
+    testcase_type: str = "UAT",
+    max_retries: int = 3,
+) -> List[Dict[str, Any]]:
+    """
+    Generates positive/negative test cases that vary ONE parent field at a time
+    — SOURCE_ID / DESTINATION / TXN_TYPE / TXN_SUB_TYPE — while EIS_PAYLOAD is
+    held fixed at its baseline ("true") value from the input JSON. All four
+    parent fields are treated as mandatory regardless of what their "required"
+    flag says in the input, since they're structurally compulsory for this API
+    type. Reuses the exact same LLM engine as EIS_PAYLOAD field generation —
+    it's simply pointed at the parent fields instead of EIS_PAYLOAD's fields.
+
+    The pure "everything at baseline" case is stripped from the result (it's
+    already produced once, in the EIS_PAYLOAD-variation batch), and every
+    remaining case is wrapped with the fixed EIS_PAYLOAD baseline plus a
+    freshly generated, unique RRN.
+    """
+    parent_fields = {
+        f: {**payload[f], "required": True}  # structurally mandatory for this API type
+        for f in (SOURCE_ID_FIELD, DESTINATION_FIELD, TXN_TYPE_FIELD, TXN_SUB_TYPE_FIELD)
+    }
+
+    testcases = generate_api_testcases_via_llm(
+        api_name=api_name,
+        api_url=api_url,
+        method=method,
+        payload=parent_fields,
+        user_prompt=user_prompt,
+        testcase_type=testcase_type,
+        max_retries=max_retries,
+    )
+
+    testcases = [
+        tc for tc in testcases
+        if not (tc.get("Test Case Type") == "Positive" and _is_full_baseline(tc.get("Test Data"), parent_fields))
+    ]
+
+    return wrap_parent_field_testcases(testcases, eis_payload_baseline, source_id_for_rrn)
 
 
 
