@@ -1026,7 +1026,20 @@ async def get_testcase_categories(
 from api.utils.eis_api_utils import call_eis_api
 from api.model import RunApiTestcasesRequest
 from api.model import APITestCaseGenerateRequest
-from api.utils.api_testcase_utils import generate_api_testcases_via_llm, apply_mandatory_fields, make_rrn
+from api.utils.api_testcase_utils import (
+    generate_api_testcases_via_llm,
+    apply_mandatory_fields,
+    make_rrn,
+    apply_wrapped_mandatory_fields,
+    wrap_testcases_in_eis_container,
+)
+
+# 'EIS'      — the original flat payload shape (field: {value, required, validation}).
+# 'EIS_CHANNEL' / 'EIS_MICROSERVICES' — parent-wrapped shape: SOURCE_ID, DESTINATION,
+#   TXN_TYPE, TXN_SUB_TYPE, REQUEST_REFERENCE_NUMBER?, EIS_PAYLOAD. Both share the
+#   exact same processing — only EIS_PAYLOAD's inner fields are exercised by the LLM.
+SUPPORTED_API_TYPES = {"EIS", "EIS_CHANNEL", "EIS_MICROSERVICES"}
+WRAPPED_API_TYPES = {"EIS_CHANNEL", "EIS_MICROSERVICES"}
 
 @testcase_router.post("/generate-api-testcases")
 async def generate_api_testcases_endpoint(
@@ -1037,24 +1050,31 @@ async def generate_api_testcases_endpoint(
     Generate positive/negative test cases for a single API from a JSON spec
     (api_name, api_url, method, payload{field: {value, required, validation}}).
 
-    Before calling the LLM:
-      - REQUEST_AUTH_ID / REQUEST_TELLER_ID / BRANCH_CODE are auto-injected with
-        default values if missing from the payload.
-      - SOURCE_ID is validated as mandatory — request is rejected if absent.
-      - REQUEST_REFERENCE_NUMBER (RRN) is derived from SOURCE_ID unless already
-        supplied by the user.
+    Two payload shapes are supported, selected via api_type:
+
+      - 'EIS' (default): the flat shape — REQUEST_AUTH_ID / REQUEST_TELLER_ID /
+        BRANCH_CODE are auto-injected with default values if missing from the
+        payload, SOURCE_ID is validated as mandatory, and REQUEST_REFERENCE_NUMBER
+        (RRN) is derived from SOURCE_ID unless already supplied by the user.
+
+      - 'EIS_CHANNEL' / 'EIS_MICROSERVICES': the parent-wrapped shape — SOURCE_ID,
+        DESTINATION, TXN_TYPE, TXN_SUB_TYPE and EIS_PAYLOAD are mandatory. Only the
+        fields inside EIS_PAYLOAD (directly, or under EIS_PAYLOAD.BODY when a
+        HEADERS/BODY split is used) are varied per test case — the four parent
+        fields stay fixed, and every test case gets its own freshly generated RRN.
     """
     tc_type = (getattr(current_user, "testcase_client", None) or "UAT").upper()
     if tc_type not in ("UAT", "SIT"):
         tc_type = "UAT"
 
-    # ── Route on API type — only EIS is implemented today ───────────────────
     api_type = (request.api_type or "EIS").strip().upper()
-    if api_type != "EIS":
+    if api_type not in SUPPORTED_API_TYPES:
         raise HTTPException(
             400,
-            f"API type '{api_type}' is not available yet. Only 'EIS' is currently supported."
+            f"API type '{api_type}' is not available yet. Supported types: "
+            f"{', '.join(sorted(SUPPORTED_API_TYPES))}."
         )
+    is_wrapped = api_type in WRAPPED_API_TYPES
 
     spec = request.api_spec
     if not spec.payload:
@@ -1062,17 +1082,29 @@ async def generate_api_testcases_endpoint(
 
     payload_dict = {k: v.dict() for k, v in spec.payload.items()}
 
-    # ── Enforce mandatory fields / auto-inject defaults (per checkbox selection) / derive RRN ─
-    try:
-        payload_dict, generated_rrn = apply_mandatory_fields(
-            payload_dict,
-            include_fields=request.mandatory_fields_to_include,
-        )
-    except ValueError as e:
-        raise HTTPException(422, str(e))
+    if is_wrapped:
+        # ── EIS Channel / EIS Microservices: validate + unwrap the parent shape ──
+        try:
+            payload_dict, gen_payload, headers, headers_key, body_key, source_id_value = (
+                apply_wrapped_mandatory_fields(payload_dict)
+            )
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        generated_rrn = None  # per-test-case unique RRNs are generated at wrap time below
+    else:
+        # ── Plain EIS: enforce mandatory fields / auto-inject defaults / derive RRN ─
+        try:
+            payload_dict, generated_rrn = apply_mandatory_fields(
+                payload_dict,
+                include_fields=request.mandatory_fields_to_include,
+            )
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+        gen_payload = payload_dict
 
     print(f"\n{'='*60}")
     print(f"API testcase generation request: {spec.api_name} ({spec.method} {spec.api_url})")
+    print(f"API type: {api_type}")
     print(f"Requested by: {current_user.email}  testcase_client={tc_type}")
     print(f"{'='*60}\n")
 
@@ -1081,17 +1113,26 @@ async def generate_api_testcases_endpoint(
             api_name=spec.api_name,
             api_url=spec.api_url,
             method=spec.method,
-            payload=payload_dict,
+            payload=gen_payload,
             user_prompt=(request.user_prompt or "").strip() or None,
             testcase_type=tc_type,
         )
     except Exception as e:
         raise HTTPException(500, f"API test case generation failed: {e}")
 
+    if is_wrapped:
+        try:
+            testcases = wrap_testcases_in_eis_container(
+                testcases, payload_dict, headers, headers_key, body_key, source_id_value,
+            )
+        except ValueError as e:
+            raise HTTPException(422, str(e))
+
     result_obj = {
         "document_name": spec.api_name,
         "api_url": spec.api_url,
         "method": spec.method.upper(),
+        "api_type": api_type,
         "testcase_client": tc_type,
         "generated_reference_number": generated_rrn,
         "summary": {
