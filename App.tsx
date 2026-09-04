@@ -561,13 +561,25 @@ const ApiGeneratePanel: React.FC<{
             <Box sx={{ width: '100%', maxWidth: 600, mb: 3 }}>
                 <Alert severity="info" sx={{ py: 0.75 }}>
                     <Typography variant="caption">
-                        💡 One baseline positive test case will be created from your{' '}
-                        {WRAPPED_API_TYPES.has(apiType) ? 'EIS_PAYLOAD fields' : 'payload'}, plus positive/negative
-                        cases for each field that has a validation rule — one field varied at a time. Any field
-                        with multiple listed values gets one extra positive case per additional value.
-                        {WRAPPED_API_TYPES.has(apiType) && (
-                            <> SOURCE_ID, DESTINATION, TXN_TYPE and TXN_SUB_TYPE stay fixed at their given value in
-                            every test case, and each test case gets its own freshly generated REQUEST_REFERENCE_NUMBER.</>
+                        {WRAPPED_API_TYPES.has(apiType) ? (
+                            <>
+                                💡 Two batches of test cases are generated, one field varied at a time, each with its
+                                own freshly generated REQUEST_REFERENCE_NUMBER:
+                                <br />
+                                1. <strong>EIS_PAYLOAD fields</strong> — varied one at a time; SOURCE_ID, DESTINATION,
+                                TXN_TYPE and TXN_SUB_TYPE stay fixed at their given value.
+                                <br />
+                                2. <strong>SOURCE_ID / DESTINATION / TXN_TYPE / TXN_SUB_TYPE</strong> — varied one at
+                                a time; EIS_PAYLOAD stays fixed at the exact values from your JSON.
+                                <br />
+                                Any field with multiple listed values gets one extra positive case per additional value.
+                            </>
+                        ) : (
+                            <>
+                                💡 One baseline positive test case will be created from your payload, plus positive/negative
+                                cases for each field that has a validation rule — one field varied at a time. Any field
+                                with multiple listed values gets one extra positive case per additional value.
+                            </>
                         )}
                     </Typography>
                 </Alert>
