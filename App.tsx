@@ -1,4 +1,3 @@
-
 // App.tsx — QA Pariksha AI
 // Changes in this version:
 //   • ResultsView table: "document_name" column hidden from display
@@ -152,10 +151,13 @@ const SAMPLE_API_JSON = {
     },
 };
 
-// EIS Channel — parent-wrapped shape, EIS_PAYLOAD holds the testable fields directly.
-const SAMPLE_API_JSON_EIS_CHANNEL = {
-    api_name: "Mobile Number Enquiry API (EIS Channel)",
-    api_url: "https://api.sbi.co.in/v1/channel/mobile-enquiry",
+// EIS Channel / EIS Microservices — parent-wrapped shape, EIS_PAYLOAD holding
+// the testable fields directly (flat). Either wrapped api_type can use this
+// shape — it's a property of what the downstream endpoint expects, not of
+// which type is selected in the dropdown.
+const SAMPLE_API_JSON_WRAPPED_FLAT = {
+    api_name: "Mobile Number Enquiry API",
+    api_url: "https://api.sbi.co.in/v1/wrapper/mobile-enquiry",
     method: "POST",
     payload: {
         SOURCE_ID: { value: "LT", required: true, validation: "type should be string, exactly 2 characters" },
@@ -173,12 +175,12 @@ const SAMPLE_API_JSON_EIS_CHANNEL = {
     },
 };
 
-// EIS Microservices — parent-wrapped shape, EIS_PAYLOAD split into HEADERS (static,
-// sent as-is) and BODY (the testable fields). The flat shape above also works here —
-// use whichever your target microservice expects.
-const SAMPLE_API_JSON_EIS_MICROSERVICES = {
-    api_name: "Mobile Number Enquiry API (EIS Microservices)",
-    api_url: "https://api.sbi.co.in/v1/microservices/mobile-enquiry",
+// EIS Channel / EIS Microservices — parent-wrapped shape, EIS_PAYLOAD split
+// into HEADERS (static, sent as-is) and BODY (the testable fields). Either
+// wrapped api_type can use this shape too — same reasoning as above.
+const SAMPLE_API_JSON_WRAPPED_HEADERS_BODY = {
+    api_name: "Purpose Enquiry API",
+    api_url: "https://api.sbi.co.in/v1/wrapper/purpose-enquiry",
     method: "POST",
     payload: {
         SOURCE_ID: { value: "LT", required: true, validation: "type should be string, exactly 2 characters" },
@@ -193,8 +195,8 @@ const SAMPLE_API_JSON_EIS_MICROSERVICES = {
                     "X-API-Version": "1",
                 },
                 BODY: {
-                    mobile_number: { value: ["9876543210", "9123456780"], required: true, validation: "Must be exactly 10 numeric digits" },
-                    pan_number: { value: "ABCDE1234F", required: false, validation: "10 characters, capital alphanumeric only" },
+                    touchPointId: { value: "OCASAGR001", required: true, validation: "Exactly 10 alphanumeric characters" },
+                    purposeSetId: { value: "PS-CIFJOURN-000091", required: true, validation: "Uppercase, matches PS-XXXXXXXX-NNNNNN format" },
                 },
             },
             required: true,
@@ -331,13 +333,10 @@ const ApiJsonUpload: React.FC<{
         reader.readAsText(f);
     };
 
-    const downloadSample = () => {
-        const sample = apiType === 'EIS_CHANNEL' ? SAMPLE_API_JSON_EIS_CHANNEL
-            : apiType === 'EIS_MICROSERVICES' ? SAMPLE_API_JSON_EIS_MICROSERVICES
-            : SAMPLE_API_JSON;
+    const downloadJson = (sample: any, filename: string) => {
         const blob = new Blob([JSON.stringify(sample, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = 'sample_api_spec.json'; a.click();
+        const a = document.createElement('a'); a.href = url; a.download = filename; a.click();
         URL.revokeObjectURL(url);
     };
 
@@ -404,9 +403,20 @@ const ApiJsonUpload: React.FC<{
                     Choose JSON File
                 </Button>
             </label>
-            <Button variant="text" size="small" onClick={downloadSample} sx={{ mb: 2, textTransform: 'none' }}>
-                📥 Download sample JSON format
-            </Button>
+            {isWrapped ? (
+                <Box sx={{ display: 'flex', gap: 1, mb: 2, flexWrap: 'wrap' }}>
+                    <Button variant="text" size="small" onClick={() => downloadJson(SAMPLE_API_JSON_WRAPPED_FLAT, 'sample_api_spec_flat.json')} sx={{ textTransform: 'none' }}>
+                        📥 Sample (flat EIS_PAYLOAD)
+                    </Button>
+                    <Button variant="text" size="small" onClick={() => downloadJson(SAMPLE_API_JSON_WRAPPED_HEADERS_BODY, 'sample_api_spec_headers_body.json')} sx={{ textTransform: 'none' }}>
+                        📥 Sample (HEADERS/BODY EIS_PAYLOAD)
+                    </Button>
+                </Box>
+            ) : (
+                <Button variant="text" size="small" onClick={() => downloadJson(SAMPLE_API_JSON, 'sample_api_spec.json')} sx={{ mb: 2, textTransform: 'none' }}>
+                    📥 Download sample JSON format
+                </Button>
+            )}
             {error && <Alert severity="error" sx={{ mb: 2, py: 0.5 }}><Typography variant="caption">{error}</Typography></Alert>}
             {fileName && !error && <Alert severity="success" sx={{ mb: 2, py: 0.5 }}><Typography variant="caption">{fileName}</Typography></Alert>}
 
