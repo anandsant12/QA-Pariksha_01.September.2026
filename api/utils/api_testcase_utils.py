@@ -192,7 +192,12 @@ def split_eis_payload_container(eis_payload_value: Any) -> tuple[Dict[str, Any],
       (b) NESTED — a dict with a "HEADERS" key (static request headers, sent as-is,
                     NEVER varied/tested) and a "BODY" key (dict of field_name ->
                     {value, required, validation} to test) — used when the target
-                    microservice expects headers alongside a body.
+                    downstream endpoint expects headers alongside a body.
+
+    Both shapes are valid under EITHER api_type (EIS Channel or EIS Microservices)
+    — the shape is a property of what the specific downstream endpoint expects,
+    NOT of which api_type was selected, so this is detected purely from the JSON
+    structure and never inferred from api_type.
 
     Returns (testable_fields, headers_or_None, headers_key_or_None, body_key_used).
     `body_key_used` is "value" for the flat shape (there's no real "BODY" key to
@@ -677,20 +682,56 @@ You are given a batch of already-executed API test cases. For each one you recei
 Decide whether each test case PASSED or FAILED, based ONLY on whether the actual
 response matches what the description says should happen for that test type.
 
+## READING THE ACTUAL_RESPONSE — TWO POSSIBLE SHAPES
+
+Actual_Response is either a plain-text gateway/network error, or decrypted JSON
+in ONE of these two shapes — figure out which one you're looking at first:
+
+1. FLAT — the business result is directly in the top-level fields:
+   RESPONSE_STATUS ("0" = accepted/success, "1" or "2" = rejected), ERROR_CODE /
+   ERROR_DESCRIPTION (non-empty = rejected), or the whole response is a
+   "GATEWAY ERROR [...]" string (always a rejection). This is what plain EIS
+   calls return, and also what a gateway-level rejection looks like for any
+   call type.
+
+2. NESTED under "EIS_RESPONSE" — this is what EIS Channel / EIS Microservices
+   calls return: the DOWNSTREAM service's own response sits inside an
+   "EIS_RESPONSE" object, with its OWN "success" (true/false), "statusCode"
+   (HTTP-style: 2xx = success, 4xx/5xx = rejection), and "errors" (non-null /
+   non-empty = rejected) fields. Top-level RESPONSE_STATUS / ERROR_CODE /
+   ERROR_DESCRIPTION sitting ALONGSIDE "EIS_RESPONSE" only report whether the
+   EIS gateway itself successfully routed the request and got a reply — that
+   is a SEPARATE concern from whether the downstream service accepted the
+   payload, and it is very common (and NOT a bug) for RESPONSE_STATUS to be
+   "0" (gateway worked fine) at the very same time "EIS_RESPONSE" shows
+   "success": false / a 4xx-5xx "statusCode" / non-empty "errors" (the
+   downstream service rejected the input). Whenever "EIS_RESPONSE" is present,
+   you MUST judge PASS/FAIL from ITS fields, NOT from the top-level
+   RESPONSE_STATUS / ERROR_CODE / ERROR_DESCRIPTION next to it. The exact field
+   names inside the nested envelope may vary slightly by downstream service
+   (e.g. "status" instead of "statusCode", errors as a list instead of an
+   object) — use judgment on the equivalent business-outcome signal, but the
+   core principle always holds: a nested envelope's OWN outcome wins over the
+   outer gateway-level fields sitting alongside it.
+
 ## RULES
 
-1. POSITIVE test cases PASS when:
-   - The actual response indicates SUCCESS — e.g. RESPONSE_STATUS "0", correct
-     customer/business data returned, no ERROR_CODE / ERROR_DESCRIPTION present.
-   They FAIL when the actual response shows an error/rejection instead of success.
+1. POSITIVE test cases PASS when the business result (per whichever shape
+   above applies) indicates SUCCESS — e.g. flat RESPONSE_STATUS "0" with no
+   ERROR_CODE/ERROR_DESCRIPTION, or (when EIS_RESPONSE is present)
+   EIS_RESPONSE.success is true / statusCode is 2xx / errors is null or empty,
+   with correct customer/business data returned.
+   They FAIL when the business result shows an error/rejection instead of
+   success.
 
-2. NEGATIVE test cases PASS when:
-   - The actual response indicates the API correctly REJECTED the invalid input —
-     e.g. RESPONSE_STATUS "1" or "2", a non-empty ERROR_CODE / ERROR_DESCRIPTION,
-     or any "GATEWAY ERROR [...]" message describing a validation rejection.
-   They FAIL when the actual response indicates the API incorrectly ACCEPTED the
-   bad input and returned success/business data anyway (this is a real bug — the
-   validation that should have blocked it did not).
+2. NEGATIVE test cases PASS when the business result (per whichever shape
+   above applies) indicates the API correctly REJECTED the invalid input —
+   e.g. flat RESPONSE_STATUS "1"/"2" or a non-empty ERROR_CODE/ERROR_DESCRIPTION,
+   any "GATEWAY ERROR [...]" message, or (when EIS_RESPONSE is present)
+   EIS_RESPONSE.success is false / statusCode is 4xx-5xx / errors is non-empty.
+   They FAIL when the business result indicates the API incorrectly ACCEPTED
+   the bad input and returned success/business data anyway (this is a real
+   bug — the validation that should have blocked it did not).
 
 3. If the Actual_Response is empty, or begins with "ERROR:" describing a network,
    timeout, decryption, or key-loading failure (NOT a business/gateway rejection),
