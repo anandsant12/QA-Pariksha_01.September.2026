@@ -1032,6 +1032,8 @@ from api.utils.api_testcase_utils import (
     make_rrn,
     apply_wrapped_mandatory_fields,
     wrap_testcases_in_eis_container,
+    build_eis_payload_baseline,
+    generate_parent_field_testcases,
 )
 
 # 'EIS'      — the original flat payload shape (field: {value, required, validation}).
@@ -1058,10 +1060,13 @@ async def generate_api_testcases_endpoint(
         (RRN) is derived from SOURCE_ID unless already supplied by the user.
 
       - 'EIS_CHANNEL' / 'EIS_MICROSERVICES': the parent-wrapped shape — SOURCE_ID,
-        DESTINATION, TXN_TYPE, TXN_SUB_TYPE and EIS_PAYLOAD are mandatory. Only the
-        fields inside EIS_PAYLOAD (directly, or under EIS_PAYLOAD.BODY when a
-        HEADERS/BODY split is used) are varied per test case — the four parent
-        fields stay fixed, and every test case gets its own freshly generated RRN.
+        DESTINATION, TXN_TYPE, TXN_SUB_TYPE and EIS_PAYLOAD are mandatory. Two
+        batches of test cases are generated and combined:
+          1. EIS_PAYLOAD fields varied one at a time, parent fields fixed.
+          2. Parent fields (SOURCE_ID / DESTINATION / TXN_TYPE / TXN_SUB_TYPE)
+             varied one at a time, EIS_PAYLOAD fixed at its baseline ("true")
+             value from the input JSON.
+        Every test case gets its own freshly generated, unique RRN.
     """
     tc_type = (getattr(current_user, "testcase_client", None) or "UAT").upper()
     if tc_type not in ("UAT", "SIT"):
@@ -1102,6 +1107,8 @@ async def generate_api_testcases_endpoint(
             raise HTTPException(422, str(e))
         gen_payload = payload_dict
 
+    user_prompt = (request.user_prompt or "").strip() or None
+
     print(f"\n{'='*60}")
     print(f"API testcase generation request: {spec.api_name} ({spec.method} {spec.api_url})")
     print(f"API type: {api_type}")
@@ -1114,7 +1121,7 @@ async def generate_api_testcases_endpoint(
             api_url=spec.api_url,
             method=spec.method,
             payload=gen_payload,
-            user_prompt=(request.user_prompt or "").strip() or None,
+            user_prompt=user_prompt,
             testcase_type=tc_type,
         )
     except Exception as e:
@@ -1127,6 +1134,34 @@ async def generate_api_testcases_endpoint(
             )
         except ValueError as e:
             raise HTTPException(422, str(e))
+
+        # ── Second batch: vary the parent keys (SOURCE_ID / DESTINATION / TXN_TYPE
+        #    / TXN_SUB_TYPE) one at a time, EIS_PAYLOAD held fixed at its baseline
+        #    ("true") value from the input JSON. ─────────────────────────────────
+        print(f"    Generating parent-key test cases (SOURCE_ID/DESTINATION/TXN_TYPE/TXN_SUB_TYPE)…")
+        try:
+            eis_payload_baseline = build_eis_payload_baseline(gen_payload, headers, headers_key, body_key)
+            parent_testcases = generate_parent_field_testcases(
+                api_name=spec.api_name,
+                api_url=spec.api_url,
+                method=spec.method,
+                payload=payload_dict,
+                eis_payload_baseline=eis_payload_baseline,
+                source_id_for_rrn=source_id_value,
+                user_prompt=user_prompt,
+                testcase_type=tc_type,
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Parent-key test case generation failed: {e}")
+
+        testcases = testcases + parent_testcases
+        # Renumber sequentially across the combined batches, and keep the
+        # "Function Description" identical across all of them (both batches
+        # describe the same API — a per-batch LLM call could otherwise phrase
+        # it slightly differently).
+        for i, tc in enumerate(testcases, start=1):
+            tc["Test Case ID"] = f"TC_API_{i:03d}"
+            tc["Function Description"] = spec.api_name
 
     result_obj = {
         "document_name": spec.api_name,
