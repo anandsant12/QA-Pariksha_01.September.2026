@@ -30,7 +30,7 @@ import AdminPanel from './components/AdminPanel';
 // ============================================================================
 const ENABLE_REGISTER_TAB = false;
 const GENERATE_FEATURE_FILE = false;
-const SHOW_API_TYPE_DROPDOWN = false;              
+const SHOW_API_TYPE_DROPDOWN = true;              
 const SHOW_MANDATORY_FIELD_CHECKBOXES = false;      
 
 // Columns to hide from the results table (lowercase keys as they appear in JSON)
@@ -132,6 +132,7 @@ export interface ApiTestCaseResult {
     document_name: string;
     api_url: string;
     method: string;
+    api_type?: string;
     testcase_client?: string;
     generated_reference_number?: string | null;
     summary: { total_testcase_count: number; positive_count?: number; negative_count?: number };
@@ -151,11 +152,72 @@ const SAMPLE_API_JSON = {
     },
 };
 
+// EIS Channel — parent-wrapped shape, EIS_PAYLOAD holds the testable fields directly.
+const SAMPLE_API_JSON_EIS_CHANNEL = {
+    api_name: "Mobile Number Enquiry API (EIS Channel)",
+    api_url: "https://api.sbi.co.in/v1/channel/mobile-enquiry",
+    method: "POST",
+    payload: {
+        SOURCE_ID: { value: "LT", required: true, validation: "type should be string, exactly 2 characters" },
+        DESTINATION: { value: "CBS", required: true, validation: "type should be string" },
+        TXN_TYPE: { value: "ENQ", required: true, validation: "type should be string" },
+        TXN_SUB_TYPE: { value: "MOB", required: true, validation: "type should be string" },
+        EIS_PAYLOAD: {
+            value: {
+                mobile_number: { value: ["9876543210", "9123456780"], required: true, validation: "Must be exactly 10 numeric digits" },
+                pan_number: { value: "ABCDE1234F", required: false, validation: "10 characters, capital alphanumeric only" },
+            },
+            required: true,
+            validation: "",
+        },
+    },
+};
+
+// EIS Microservices — parent-wrapped shape, EIS_PAYLOAD split into HEADERS (static,
+// sent as-is) and BODY (the testable fields). The flat shape above also works here —
+// use whichever your target microservice expects.
+const SAMPLE_API_JSON_EIS_MICROSERVICES = {
+    api_name: "Mobile Number Enquiry API (EIS Microservices)",
+    api_url: "https://api.sbi.co.in/v1/microservices/mobile-enquiry",
+    method: "POST",
+    payload: {
+        SOURCE_ID: { value: "LT", required: true, validation: "type should be string, exactly 2 characters" },
+        DESTINATION: { value: "CBS", required: true, validation: "type should be string" },
+        TXN_TYPE: { value: "ENQ", required: true, validation: "type should be string" },
+        TXN_SUB_TYPE: { value: "MOB", required: true, validation: "type should be string" },
+        EIS_PAYLOAD: {
+            value: {
+                HEADERS: {
+                    "Accept-Language": "eng",
+                    "X-Correlation-Id": "019ed939-84d7-71aa-b444-4b9eb297b217",
+                    "X-API-Version": "1",
+                },
+                BODY: {
+                    mobile_number: { value: ["9876543210", "9123456780"], required: true, validation: "Must be exactly 10 numeric digits" },
+                    pan_number: { value: "ABCDE1234F", required: false, validation: "10 characters, capital alphanumeric only" },
+                },
+            },
+            required: true,
+            validation: "",
+        },
+    },
+};
+
 const API_TYPE_OPTIONS: { value: string; label: string; enabled: boolean }[] = [
-    { value: 'EIS',      label: 'EIS',                 enabled: true },
-    { value: 'OPTION_2', label: 'Option 2 (Coming Soon)', enabled: false },
-    { value: 'OPTION_3', label: 'Option 3 (Coming Soon)', enabled: false },
+    { value: 'EIS',                label: 'EIS',                  enabled: true },
+    { value: 'EIS_CHANNEL',        label: 'EIS Channel',          enabled: true },
+    { value: 'EIS_MICROSERVICES',  label: 'EIS Microservices',    enabled: true },
 ];
+
+// API types that use the parent-wrapped payload shape (SOURCE_ID, DESTINATION,
+// TXN_TYPE, TXN_SUB_TYPE, REQUEST_REFERENCE_NUMBER?, EIS_PAYLOAD) rather than the
+// flat one.
+const WRAPPED_API_TYPES = new Set(['EIS_CHANNEL', 'EIS_MICROSERVICES']);
+
+const getRequiredParentFields = (apiType: string): string[] =>
+    WRAPPED_API_TYPES.has(apiType)
+        ? ['SOURCE_ID', 'DESTINATION', 'TXN_TYPE', 'TXN_SUB_TYPE', 'EIS_PAYLOAD']
+        : ['SOURCE_ID'];
 
 const MANDATORY_FIELD_OPTIONS = ['REQUEST_AUTH_ID', 'REQUEST_TELLER_ID', 'BRANCH_CODE'] as const;
 type MandatoryFieldFlags = Record<typeof MANDATORY_FIELD_OPTIONS[number], boolean>;
@@ -270,11 +332,28 @@ const ApiJsonUpload: React.FC<{
     };
 
     const downloadSample = () => {
-        const blob = new Blob([JSON.stringify(SAMPLE_API_JSON, null, 2)], { type: 'application/json' });
+        const sample = apiType === 'EIS_CHANNEL' ? SAMPLE_API_JSON_EIS_CHANNEL
+            : apiType === 'EIS_MICROSERVICES' ? SAMPLE_API_JSON_EIS_MICROSERVICES
+            : SAMPLE_API_JSON;
+        const blob = new Blob([JSON.stringify(sample, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a'); a.href = url; a.download = 'sample_api_spec.json'; a.click();
         URL.revokeObjectURL(url);
     };
+
+    // Push an edit to one payload field's value back up to the parent — reuses
+    // onParsed (already resets apiResult, which is correct here too: editing the
+    // spec after a previous generation should invalidate that stale result).
+    const updateFieldValue = (key: string, newValue: any) => {
+        onParsed({
+            ...apiSpec!,
+            payload: { ...apiSpec!.payload, [key]: { ...apiSpec!.payload[key], value: newValue } },
+        });
+    };
+
+    const requiredParentFields = getRequiredParentFields(apiType);
+    const missingRequiredFields = apiSpec ? requiredParentFields.filter(f => !(f in apiSpec.payload)) : [];
+    const isWrapped = WRAPPED_API_TYPES.has(apiType);
 
     return (
         <Box>
@@ -338,14 +417,17 @@ const ApiJsonUpload: React.FC<{
                         <Tooltip title="Clear"><IconButton size="small" onClick={onClear} sx={{ color: 'error.main' }}><Clear fontSize="small" /></IconButton></Tooltip>
                     </Box>
 
-                    {!('SOURCE_ID' in apiSpec.payload) && (
+                    {missingRequiredFields.length > 0 && (
                         <Alert severity="error" sx={{ mb: 1.5, py: 0.5 }}>
                             <Typography variant="caption">
-                                SOURCE_ID is missing. This field is mandatory — please add it to your JSON before generating.
+                                {missingRequiredFields.join(', ')} {missingRequiredFields.length > 1 ? 'are' : 'is'} missing.
+                                {missingRequiredFields.length > 1 ? ' These fields are' : ' This field is'} mandatory for
+                                {' '}{API_TYPE_OPTIONS.find(o => o.value === apiType)?.label || apiType} — please add
+                                {missingRequiredFields.length > 1 ? ' them' : ' it'} to your JSON before generating.
                             </Typography>
                         </Alert>
                     )}
-                    {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && mandatoryFields[f]).length > 0 && (
+                    {!isWrapped && MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && mandatoryFields[f]).length > 0 && (
                         <Alert severity="info" sx={{ mb: 1.5, py: 0.5 }}>
                             <Typography variant="caption">
                                 {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && mandatoryFields[f]).join(' / ')}
@@ -353,7 +435,7 @@ const ApiJsonUpload: React.FC<{
                             </Typography>
                         </Alert>
                     )}
-                    {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && !mandatoryFields[f]).length > 0 && (
+                    {!isWrapped && MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && !mandatoryFields[f]).length > 0 && (
                         <Alert severity="warning" sx={{ mb: 1.5, py: 0.5 }}>
                             <Typography variant="caption">
                                 {MANDATORY_FIELD_OPTIONS.filter(f => !(f in apiSpec.payload) && !mandatoryFields[f]).join(' / ')}
@@ -364,8 +446,9 @@ const ApiJsonUpload: React.FC<{
                     {!('REQUEST_REFERENCE_NUMBER' in apiSpec.payload) && ('SOURCE_ID' in apiSpec.payload) && (
                         <Alert severity="info" sx={{ mb: 1.5, py: 0.5 }}>
                             <Typography variant="caption">
-                                REQUEST_REFERENCE_NUMBER will be generated from SOURCE_ID for reference, but won't be
-                                added as a payload field since it wasn't in your input JSON.
+                                {isWrapped
+                                    ? 'REQUEST_REFERENCE_NUMBER will be auto-generated from SOURCE_ID for every test case (a fresh, unique value per row).'
+                                    : "REQUEST_REFERENCE_NUMBER will be generated from SOURCE_ID for reference, but won't be added as a payload field since it wasn't in your input JSON."}
                             </Typography>
                         </Alert>
                     )}
@@ -376,27 +459,53 @@ const ApiJsonUpload: React.FC<{
                             {apiSpec.method} {apiSpec.api_url}
                         </Typography>
                         <Divider sx={{ my: 1 }} />
-                        {Object.entries(apiSpec.payload).map(([key, field]) => (
-                            <Box key={key} sx={{ mb: 1 }}>
-                                <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
-                                    <Typography variant="caption" sx={{ fontWeight: 600 }}>{key}</Typography>
-                                    {field.required !== false && (
-                                        <Chip label="required" size="small" sx={{ height: 16, fontSize: '0.6rem' }} />
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1, fontStyle: 'italic' }}>
+                            Values below are editable — e.g. change DESTINATION to test against a different one.
+                        </Typography>
+                        {Object.entries(apiSpec.payload).map(([key, field]) => {
+                            const isArrayVal = Array.isArray(field.value);
+                            const isObjectVal = field.value !== null && typeof field.value === 'object' && !isArrayVal;
+                            return (
+                                <Box key={key} sx={{ mb: 1 }}>
+                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                                        <Typography variant="caption" sx={{ fontWeight: 600 }}>{key}</Typography>
+                                        {field.required !== false && (
+                                            <Chip label="required" size="small" sx={{ height: 16, fontSize: '0.6rem' }} />
+                                        )}
+                                        {isArrayVal && field.value.length > 1 && (
+                                            <Chip label={`${field.value.length} valid values`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
+                                        )}
+                                        {isObjectVal && (
+                                            <Chip label={`${Object.keys(field.value).length} inner field(s)`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
+                                        )}
+                                    </Box>
+                                    {isObjectVal ? (
+                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                                            Nested object — edit the JSON file to change these fields.
+                                        </Typography>
+                                    ) : isArrayVal ? (
+                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                                            Values: {field.value.map(String).join(' | ')}
+                                        </Typography>
+                                    ) : (
+                                        <TextField
+                                            variant="standard"
+                                            size="small"
+                                            fullWidth
+                                            value={field.value ?? ''}
+                                            onChange={e => updateFieldValue(key, e.target.value)}
+                                            inputProps={{ style: { fontSize: '0.75rem' } }}
+                                            sx={{ mt: 0.25 }}
+                                        />
                                     )}
-                                    {Array.isArray(field.value) && field.value.length > 1 && (
-                                        <Chip label={`${field.value.length} valid values`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
+                                    {field.validation && (
+                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                                            Rule: {field.validation}
+                                        </Typography>
                                     )}
                                 </Box>
-                                <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                                    {Array.isArray(field.value) ? `Values: ${field.value.map(String).join(' | ')}` : `Value: ${String(field.value)}`}
-                                </Typography>
-                                {field.validation && (
-                                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                                        Rule: {field.validation}
-                                    </Typography>
-                                )}
-                            </Box>
-                        ))}
+                            );
+                        })}
                     </Box>
                 </Box>
             )}
@@ -408,13 +517,14 @@ const ApiJsonUpload: React.FC<{
 
 const ApiGeneratePanel: React.FC<{
     apiSpec: ApiSpec;
+    apiType: string;
     userPrompt: string;
     onUserPromptChange: (p: string) => void;
     onGenerate: () => void;
-}> = ({ apiSpec, userPrompt, onUserPromptChange, onGenerate }) => {
+}> = ({ apiSpec, apiType, userPrompt, onUserPromptChange, onGenerate }) => {
     const fieldCount = Object.keys(apiSpec.payload).length;
     const validatedFieldCount = Object.values(apiSpec.payload).filter(f => (f.validation || '').trim()).length;
-    const missingSourceId = !('SOURCE_ID' in apiSpec.payload);
+    const missingRequiredFields = getRequiredParentFields(apiType).filter(f => !(f in apiSpec.payload));
 
     return (
         <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', height: '100%', overflowY: 'auto', px: 2, py: 3 }}>
@@ -431,11 +541,12 @@ const ApiGeneratePanel: React.FC<{
                 <Chip label={`${validatedFieldCount} validated`} color="info" size="small" />
             </Box>
 
-            {missingSourceId && (
+            {missingRequiredFields.length > 0 && (
                 <Box sx={{ width: '100%', maxWidth: 600, mb: 2 }}>
                     <Alert severity="error">
                         <Typography variant="caption">
-                            SOURCE_ID is mandatory. Please add it to your JSON file and re-upload before generating.
+                            {missingRequiredFields.join(', ')} {missingRequiredFields.length > 1 ? 'are' : 'is'} mandatory.
+                            Please add {missingRequiredFields.length > 1 ? 'them' : 'it'} to your JSON file and re-upload before generating.
                         </Typography>
                     </Alert>
                 </Box>
@@ -450,14 +561,19 @@ const ApiGeneratePanel: React.FC<{
             <Box sx={{ width: '100%', maxWidth: 600, mb: 3 }}>
                 <Alert severity="info" sx={{ py: 0.75 }}>
                     <Typography variant="caption">
-                        💡 One baseline positive test case will be created from your payload, plus positive/negative
+                        💡 One baseline positive test case will be created from your{' '}
+                        {WRAPPED_API_TYPES.has(apiType) ? 'EIS_PAYLOAD fields' : 'payload'}, plus positive/negative
                         cases for each field that has a validation rule — one field varied at a time. Any field
                         with multiple listed values gets one extra positive case per additional value.
+                        {WRAPPED_API_TYPES.has(apiType) && (
+                            <> SOURCE_ID, DESTINATION, TXN_TYPE and TXN_SUB_TYPE stay fixed at their given value in
+                            every test case, and each test case gets its own freshly generated REQUEST_REFERENCE_NUMBER.</>
+                        )}
                     </Typography>
                 </Alert>
             </Box>
             <Box sx={{ width: '100%', maxWidth: 600, pb: 2 }}>
-                <Button variant="contained" fullWidth size="large" onClick={onGenerate} disabled={missingSourceId} startIcon={<AutoAwesome />}
+                <Button variant="contained" fullWidth size="large" onClick={onGenerate} disabled={missingRequiredFields.length > 0} startIcon={<AutoAwesome />}
                     sx={{ background: 'linear-gradient(135deg, #1aa7d1 0%, #1f3c88 100%)', py: 1.75, fontWeight: 700, textTransform: 'none' }}>
                     Generate API Testcases
                 </Button>
@@ -608,7 +724,15 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         <Box>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2, gap: 2, flexWrap: 'wrap' }}>
                 <Box>
-                    <Typography variant="h5" sx={{ fontWeight: 600 }}>API Test Case Results</Typography>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Typography variant="h5" sx={{ fontWeight: 600 }}>API Test Case Results</Typography>
+                        {result.api_type && result.api_type !== 'EIS' && (
+                            <Chip
+                                label={API_TYPE_OPTIONS.find(o => o.value === result.api_type)?.label || result.api_type}
+                                size="small" color="info" variant="outlined"
+                            />
+                        )}
+                    </Box>
                     <Typography variant="body2" color="text.secondary">{result.document_name} — {result.method} {result.api_url}</Typography>
                     {result.generated_reference_number && (
                         <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
@@ -2374,7 +2498,7 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
                             apiResult ? (
                                 <ApiResultsView result={apiResult} onReset={handleClearApiSpec} />
                             ) : apiSpec ? (
-                                <ApiGeneratePanel apiSpec={apiSpec} userPrompt={apiUserPrompt} onUserPromptChange={setApiUserPrompt} onGenerate={handleGenerateApi} />
+                                <ApiGeneratePanel apiSpec={apiSpec} apiType={apiType} userPrompt={apiUserPrompt} onUserPromptChange={setApiUserPrompt} onGenerate={handleGenerateApi} />
                             ) : (
                                 <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: 'text.secondary' }}>
                                     <Box sx={{ textAlign: 'center' }}>
