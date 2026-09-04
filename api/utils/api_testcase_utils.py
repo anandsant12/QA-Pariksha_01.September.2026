@@ -45,6 +45,18 @@ MANDATORY_DEFAULT_FIELDS: Dict[str, Dict[str, Any]] = {
 SOURCE_ID_FIELD = "SOURCE_ID"
 RRN_FIELD = "REQUEST_REFERENCE_NUMBER"
 
+# ── EIS Channel / EIS Microservices: parent-wrapped payload shape ──────────
+# { SOURCE_ID, DESTINATION, TXN_TYPE, TXN_SUB_TYPE, REQUEST_REFERENCE_NUMBER?, EIS_PAYLOAD }
+# Only EIS_PAYLOAD's inner fields are ever exercised by the LLM; the four other
+# parent fields stay fixed at their baseline value in every generated test case,
+# and RRN is freshly generated per test case regardless of whether the user
+# supplied one (a banking RRN must be unique per call).
+DESTINATION_FIELD    = "DESTINATION"
+TXN_TYPE_FIELD       = "TXN_TYPE"
+TXN_SUB_TYPE_FIELD   = "TXN_SUB_TYPE"
+EIS_PAYLOAD_FIELD    = "EIS_PAYLOAD"
+WRAPPED_PARENT_FIELDS = [SOURCE_ID_FIELD, DESTINATION_FIELD, TXN_TYPE_FIELD, TXN_SUB_TYPE_FIELD, EIS_PAYLOAD_FIELD]
+
 
 RRN_TOTAL_LENGTH = 25
 RRN_PREFIX = "SBI"
@@ -157,6 +169,139 @@ def apply_mandatory_fields(
         # unless the user supplied it themselves.
 
     return payload, generated_rrn
+
+
+# ============================================================================
+# EIS Channel / EIS Microservices — parent-wrapped payload handling
+# ============================================================================
+
+def _find_key_ci(d: Dict[str, Any], name: str) -> Optional[str]:
+    """Case-insensitive lookup of a key name inside dict d — returns the actual
+    key as it appears in d, or None if not present."""
+    for k in d.keys():
+        if isinstance(k, str) and k.lower() == name.lower():
+            return k
+    return None
+
+
+def split_eis_payload_container(eis_payload_value: Any) -> tuple[Dict[str, Any], Optional[Dict[str, Any]], Optional[str], str]:
+    """
+    EIS_PAYLOAD's "value" can be either:
+      (a) FLAT   — a dict of field_name -> {value, required, validation} to test
+                    directly, e.g. {"mobile_number": {...}, "pan_number": {...}}.
+      (b) NESTED — a dict with a "HEADERS" key (static request headers, sent as-is,
+                    NEVER varied/tested) and a "BODY" key (dict of field_name ->
+                    {value, required, validation} to test) — used when the target
+                    microservice expects headers alongside a body.
+
+    Returns (testable_fields, headers_or_None, headers_key_or_None, body_key_used).
+    `body_key_used` is "value" for the flat shape (there's no real "BODY" key to
+    report — it's a placeholder so callers always get a string back).
+    """
+    if not isinstance(eis_payload_value, dict) or not eis_payload_value:
+        raise ValueError(
+            "EIS_PAYLOAD.value must be an object — either field specs directly, or "
+            "a {HEADERS, BODY} object with BODY holding the field specs."
+        )
+
+    body_key = _find_key_ci(eis_payload_value, "BODY")
+    if body_key is not None:
+        headers_key = _find_key_ci(eis_payload_value, "HEADERS")
+        headers = eis_payload_value.get(headers_key) if headers_key else {}
+        body = eis_payload_value.get(body_key)
+        if not isinstance(body, dict) or not body:
+            raise ValueError(f"EIS_PAYLOAD.value.{body_key} must be a non-empty object of field specs.")
+        return body, (headers if isinstance(headers, dict) else {}), (headers_key or "HEADERS"), body_key
+
+    # Flat shape — the whole object is field specs.
+    return eis_payload_value, None, None, "value"
+
+
+def apply_wrapped_mandatory_fields(
+    payload: Dict[str, Dict[str, Any]],
+) -> tuple[Dict[str, Dict[str, Any]], Dict[str, Any], Optional[Dict[str, Any]], Optional[str], str, str]:
+    """
+    Validates and unpacks the parent-wrapped payload shape used by the EIS Channel
+    and EIS Microservices API types:
+
+        { SOURCE_ID, DESTINATION, TXN_TYPE, TXN_SUB_TYPE, REQUEST_REFERENCE_NUMBER?, EIS_PAYLOAD }
+
+    SOURCE_ID / DESTINATION / TXN_TYPE / TXN_SUB_TYPE / EIS_PAYLOAD are mandatory.
+    REQUEST_REFERENCE_NUMBER is never required here — a fresh, unique one is
+    generated for every test case at wrap time regardless of whether the user
+    supplied one (see wrap_testcases_in_eis_container) — a banking RRN must be
+    unique per call, so reusing a single supplied value across every test case
+    would just get every row rejected as a duplicate once actually run.
+
+    Returns:
+      (payload, testable_fields, headers_or_None, headers_key_or_None, body_key_used, source_id_value)
+    """
+    payload = dict(payload)  # shallow copy — don't mutate the caller's dict
+
+    missing = [f for f in WRAPPED_PARENT_FIELDS if f not in payload]
+    if missing:
+        raise ValueError(f"Missing mandatory field(s) for this API type: {', '.join(missing)}.")
+
+    for field_name in (SOURCE_ID_FIELD, DESTINATION_FIELD, TXN_TYPE_FIELD, TXN_SUB_TYPE_FIELD):
+        if _baseline_value(payload[field_name]) in (None, ""):
+            raise ValueError(f"'{field_name}' is mandatory. Please provide a value for it.")
+
+    source_id_value = str(_baseline_value(payload[SOURCE_ID_FIELD])).strip().upper()
+    if len(source_id_value) != 2:
+        raise ValueError(
+            f"SOURCE_ID '{source_id_value}' must be exactly 2 characters for this API type — "
+            f"it's used as the RRN channel identifier for every generated test case."
+        )
+
+    eis_spec = payload[EIS_PAYLOAD_FIELD]
+    eis_value = eis_spec.get("value") if isinstance(eis_spec, dict) else None
+    testable_fields, headers, headers_key, body_key = split_eis_payload_container(eis_value)
+    if not testable_fields:
+        raise ValueError("EIS_PAYLOAD must contain at least one field to test.")
+
+    return payload, testable_fields, headers, headers_key, body_key, source_id_value
+
+
+def wrap_testcases_in_eis_container(
+    testcases: List[Dict[str, Any]],
+    payload: Dict[str, Dict[str, Any]],
+    headers: Optional[Dict[str, Any]],
+    headers_key: Optional[str],
+    body_key: str,
+    source_id_value: str,
+) -> List[Dict[str, Any]]:
+    """
+    Rebuilds every generated test case's "Test Data" into the full envelope the EIS
+    Channel / EIS Microservices API types expect: SOURCE_ID / DESTINATION / TXN_TYPE
+    / TXN_SUB_TYPE at their fixed baseline values (unchanged across every test case
+    — only EIS_PAYLOAD is ever varied), a freshly generated unique
+    REQUEST_REFERENCE_NUMBER per test case, and EIS_PAYLOAD itself rebuilt in
+    whichever shape (flat, or {HEADERS, BODY}) the input used.
+
+    This REQUEST_REFERENCE_NUMBER is what run_api_testcases_endpoint later passes
+    to call_eis_api as the `rrn` argument — since it lives right here inside the
+    SAME dict that gets encrypted, and call_eis_api also places its `rrn` argument
+    into the outer unencrypted envelope, the two always match automatically.
+    """
+    parent_baseline = {
+        SOURCE_ID_FIELD:    _baseline_value(payload[SOURCE_ID_FIELD]),
+        DESTINATION_FIELD:  _baseline_value(payload[DESTINATION_FIELD]),
+        TXN_TYPE_FIELD:     _baseline_value(payload[TXN_TYPE_FIELD]),
+        TXN_SUB_TYPE_FIELD: _baseline_value(payload[TXN_SUB_TYPE_FIELD]),
+    }
+
+    wrapped: List[Dict[str, Any]] = []
+    for tc in testcases:
+        inner_td = tc.get("Test Data") or {}
+        eis_payload_value: Any = {headers_key: (headers or {}), body_key: inner_td} if headers_key else inner_td
+
+        full_td = {
+            **parent_baseline,
+            RRN_FIELD: make_rrn(source_id_value),
+            EIS_PAYLOAD_FIELD: eis_payload_value,
+        }
+        wrapped.append({**tc, "Test Data": full_td})
+    return wrapped
 
 
 API_TESTCASE_SYSTEM_PROMPT = """You are an expert API test analyst for a banking application (State Bank of India).
