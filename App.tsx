@@ -620,7 +620,8 @@ export const evaluateApiTestCases = async (
 
 const API_TC_COLUMNS = [
     'Function Description', 'Test Case ID', 'Test Case Description',
-    'Test Case Type', 'API_URL', 'API_METHOD', 'Test Data', 'Actual_Response',
+    'Test Case Type', 'API_URL', 'API_METHOD', 'Test Data',
+    'Encrypted_Payload', 'Encrypted_Response', 'Actual_Response',
     'Pass_Fail', 'Remarks',
 ];
 
@@ -632,9 +633,59 @@ const COLUMN_WIDTH: Record<string, number> = {
     'API_URL': 200,
     'API_METHOD': 90,
     'Test Data': 280,
+    'Encrypted_Payload': 260,
+    'Encrypted_Response': 260,
     'Actual_Response': 340,
     'Pass_Fail': 90,
     'Remarks': 260,
+};
+
+// Columns a user is allowed to hand-edit in the "download → edit → re-upload" flow —
+// deliberately excludes Encrypted_Payload / Encrypted_Response / Actual_Response /
+// Pass_Fail / Remarks, since those don't exist yet before the test cases are run.
+const EDITABLE_API_TC_COLUMNS = [
+    'Function Description', 'Test Case ID', 'Test Case Description',
+    'Test Case Type', 'API_URL', 'API_METHOD', 'Test Data',
+];
+
+// Columns that get the tall, scrollable "code block" cell styling.
+const SCROLLABLE_CELL_COLUMNS = new Set(['Test Data', 'Encrypted_Payload', 'Encrypted_Response', 'Actual_Response']);
+
+// Keys inside Encrypted_Payload / Encrypted_Response that are short/identifying and
+// safe to show in full on screen (e.g. the RRN) — every other string value gets
+// truncated in the table preview. The full, untruncated data always goes into the
+// downloaded Excel file.
+const ENCRYPTED_FIELD_FULL_KEYS = new Set(['REQUEST_REFERENCE_NUMBER']);
+const ENCRYPTED_PREVIEW_CHARS = 20;
+
+const truncateEncryptedObject = (obj: any): any => {
+    if (!obj || typeof obj !== 'object') return obj;
+    const out: Record<string, any> = {};
+    Object.entries(obj).forEach(([k, v]) => {
+        out[k] = (typeof v === 'string' && v.length > ENCRYPTED_PREVIEW_CHARS && !ENCRYPTED_FIELD_FULL_KEYS.has(k))
+            ? `${v.slice(0, ENCRYPTED_PREVIEW_CHARS)}…`
+            : v;
+    });
+    return out;
+};
+
+const parseIfJsonString = (val: any): any => {
+    if (typeof val !== 'string') return val;
+    try { return JSON.parse(val); } catch { return val; }
+};
+
+// Table cell preview — DIGI_SIGN / REQUEST / RESPONSE truncated to 20 chars.
+const formatEncryptedPreview = (val: any): string => {
+    if (val === undefined || val === null || val === '') return '';
+    const obj = parseIfJsonString(val);
+    return (obj && typeof obj === 'object') ? JSON.stringify(truncateEncryptedObject(obj), null, 2) : String(obj);
+};
+
+// Excel export — complete, untruncated values.
+const formatEncryptedFull = (val: any): string => {
+    if (val === undefined || val === null || val === '') return '';
+    const obj = parseIfJsonString(val);
+    return (obj && typeof obj === 'object') ? JSON.stringify(obj, null, 2) : String(obj);
 };
 
 const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void }> = ({ result, onReset }) => {
@@ -651,6 +702,12 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
     const [evaluatedTestcases, setEvaluatedTestcases] = useState<any[] | null>(null);
     const [evalSummary, setEvalSummary] = useState<{ pass_count: number; fail_count: number } | null>(null);
 
+    // ── Download-to-edit / re-upload flow ────────────────────────────────────
+    const [uploadedTestcases, setUploadedTestcases] = useState<any[] | null>(null);
+    const [uploadError, setUploadError] = useState('');
+    const [downloadDialogOpen, setDownloadDialogOpen] = useState(false);
+    const fileInputRef = useRef<HTMLInputElement>(null);
+
     const baseTestcases: any[] = (() => {
         if (Array.isArray(result.combined_testcases)) return result.combined_testcases;
         if (typeof result.combined_testcases === 'string') {
@@ -659,8 +716,12 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         return [];
     })();
 
-    // Precedence: evaluated (has Pass_Fail) > ran (has Actual_Response) > base
-    const testcases: any[] = evaluatedTestcases ?? ranTestcases ?? baseTestcases;
+    // What "Run All Testcases" actually runs against: the user's edited/uploaded
+    // file if they've uploaded one, otherwise the AI-generated test cases as-is.
+    const activeSourceTestcases: any[] = uploadedTestcases ?? baseTestcases;
+
+    // Precedence: evaluated (has Pass_Fail) > ran (has Actual_Response) > uploaded > base
+    const testcases: any[] = evaluatedTestcases ?? ranTestcases ?? uploadedTestcases ?? baseTestcases;
     const hasRun = ranTestcases !== null || evaluatedTestcases !== null;
     const hasEvaluated = evaluatedTestcases !== null;
 
@@ -668,7 +729,7 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         setRunning(true); setRunError('');
         try {
             const updated = await runApiTestCases(
-                baseTestcases,
+                activeSourceTestcases,
                 result.api_url,
                 result.generated_reference_number,
             );
@@ -683,7 +744,7 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
     };
 
     const handleRunAutomation = async () => {
-        const source = ranTestcases ?? baseTestcases;
+        const source = ranTestcases ?? activeSourceTestcases;
         setEvaluating(true); setEvalError('');
         try {
             const { testcases: updated, summary } = await evaluateApiTestCases(source);
@@ -696,7 +757,49 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         }
     };
 
-    const cleanData = testcases.map(tc => ({
+    // Opens the file picker for uploading a hand-edited xlsx back in.
+    const handleUploadEditedFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0];
+        e.target.value = ''; // allow re-selecting the same filename later
+        if (!file) return;
+        setUploadError('');
+        const reader = new FileReader();
+        reader.onload = (evt) => {
+            try {
+                const data = evt.target?.result;
+                const wb = XLSX.read(data, { type: 'array' });
+                const sheetName = wb.SheetNames.find(n => n !== 'Read Me First') || wb.SheetNames[0];
+                const ws = wb.Sheets[sheetName];
+                const rows: any[] = XLSX.utils.sheet_to_json(ws, { defval: '' });
+                if (rows.length === 0) throw new Error('The uploaded file has no test case rows.');
+                const parsed = rows.map((r, idx) => {
+                    let testData: any = r['Test Data'];
+                    if (typeof testData === 'string' && testData.trim()) {
+                        try { testData = JSON.parse(testData); }
+                        catch { throw new Error(`Row ${idx + 1} (Test Case ID: ${r['Test Case ID'] || '?'}) — "Test Data" is not valid JSON. Fix it and re-upload.`); }
+                    }
+                    return { ...r, 'Test Data': testData };
+                });
+                setUploadedTestcases(parsed);
+                setRanTestcases(null); setEvaluatedTestcases(null); setEvalSummary(null);
+                setRunError(''); setEvalError(''); setPage(0);
+            } catch (err: any) {
+                setUploadError(err.message || 'Could not read the uploaded file. Make sure it is the .xlsx you downloaded and edited.');
+            }
+        };
+        reader.onerror = () => setUploadError('Could not read the uploaded file.');
+        reader.readAsArrayBuffer(file);
+    };
+
+    const handleDiscardUpload = () => {
+        setUploadedTestcases(null);
+        setRanTestcases(null); setEvaluatedTestcases(null); setEvalSummary(null);
+        setUploadError(''); setPage(0);
+    };
+
+    // Builds one display row. truncateEncrypted=true for the on-screen table
+    // (short previews); false for the final Excel export (full data).
+    const buildResultRow = (tc: any, truncateEncrypted: boolean) => ({
         'Function Description': tc['Function Description'] || '',
         'Test Case ID': tc['Test Case ID'] || '',
         'Test Case Description': tc['Test Case Description'] || '',
@@ -704,23 +807,67 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         'API_URL': tc['API_URL'] || result.api_url || '',
         'API_METHOD': tc['API_METHOD'] || result.method || '',
         'Test Data': typeof tc['Test Data'] === 'object' ? JSON.stringify(tc['Test Data'], null, 2) : String(tc['Test Data'] || ''),
+        'Encrypted_Payload': truncateEncrypted ? formatEncryptedPreview(tc['Encrypted_Payload']) : formatEncryptedFull(tc['Encrypted_Payload']),
+        'Encrypted_Response': truncateEncrypted ? formatEncryptedPreview(tc['Encrypted_Response']) : formatEncryptedFull(tc['Encrypted_Response']),
         'Actual_Response': tc['Actual_Response'] !== undefined && tc['Actual_Response'] !== null ? String(tc['Actual_Response']) : '',
         'Pass_Fail': tc['Pass_Fail'] || '',
         'Remarks': tc['Remarks'] || '',
-    }));
+    });
+
+    const cleanData = testcases.map(tc => buildResultRow(tc, true));
 
     const visibleColumns = API_TC_COLUMNS.filter(c => {
-        if (c === 'Actual_Response') return hasRun;
+        if (c === 'Actual_Response' || c === 'Encrypted_Payload' || c === 'Encrypted_Response') return hasRun;
         if (c === 'Pass_Fail' || c === 'Remarks') return hasEvaluated;
         return true;
     });
     const totalTableWidth = visibleColumns.reduce((sum, h) => sum + (COLUMN_WIDTH[h] || 180), 0);
 
+    // Pre-run download: just the editable fields, for the user to tweak and re-upload.
+    const doDownloadForEditing = () => {
+        const source = activeSourceTestcases;
+        if (source.length === 0) return;
+        const exportRows = source.map(tc => {
+            const row: Record<string, any> = {};
+            EDITABLE_API_TC_COLUMNS.forEach(c => {
+                if (c === 'Test Data') row[c] = typeof tc['Test Data'] === 'object' ? JSON.stringify(tc['Test Data'], null, 2) : String(tc['Test Data'] || '');
+                else if (c === 'API_URL') row[c] = tc['API_URL'] || result.api_url || '';
+                else if (c === 'API_METHOD') row[c] = tc['API_METHOD'] || result.method || '';
+                else row[c] = tc[c] || '';
+            });
+            return row;
+        });
+
+        const ws = XLSX.utils.json_to_sheet(exportRows);
+        ws['!cols'] = EDITABLE_API_TC_COLUMNS.map(h => ({
+            wch: Math.min(Math.max(h.length, ...exportRows.map((r: any) => String(r[h] ?? '').length)) + 2, 100),
+        }));
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'API Test Cases');
+
+        // Instructions travel with the file itself, on a second sheet.
+        const readMeRows = [
+            { 'Read this before editing': 'One row per test case. Edit values below, save, then re-upload this file with "Upload Edited Testcases" in the app.' },
+            { 'Read this before editing': "1. Don't rename, remove, or reorder columns — the app matches them by header name." },
+            { 'Read this before editing': '2. "Test Data" must stay valid JSON after your edit (matching quotes/braces) — it is re-parsed on upload.' },
+            { 'Read this before editing': '3. If you change a value inside "Test Data" (the payload), also update "Test Case Description" for that row, so it still describes what is being tested.' },
+            { 'Read this before editing': '4. Leave "Test Case ID" unchanged unless you mean to — it is used to match results back to each row.' },
+        ];
+        const wsInfo = XLSX.utils.json_to_sheet(readMeRows);
+        wsInfo['!cols'] = [{ wch: 110 }];
+        XLSX.utils.book_append_sheet(wb, wsInfo, 'Read Me First');
+
+        XLSX.writeFile(wb, `${result.document_name}_api_testcases_editable.xlsx`);
+        setDownloadDialogOpen(false);
+    };
+
+    // Post-run download: full results, including complete (untruncated) encrypted data.
     const downloadExcel = () => {
-        if (cleanData.length === 0) return;
-        const exportRows = cleanData.map(row => {
+        if (testcases.length === 0) return;
+        const exportRows = testcases.map(tc => {
+            const full = buildResultRow(tc, false);
             const ordered: Record<string, any> = {};
-            visibleColumns.forEach(c => { ordered[c] = (row as any)[c]; });
+            visibleColumns.forEach(c => { ordered[c] = (full as any)[c]; });
             return ordered;
         });
         const ws = XLSX.utils.json_to_sheet(exportRows);
@@ -746,13 +893,16 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         <Box>
             <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 2, gap: 2, flexWrap: 'wrap' }}>
                 <Box>
-                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, flexWrap: 'wrap' }}>
                         <Typography variant="h5" sx={{ fontWeight: 600 }}>API Test Case Results</Typography>
                         {result.api_type && result.api_type !== 'EIS' && (
                             <Chip
                                 label={API_TYPE_OPTIONS.find(o => o.value === result.api_type)?.label || result.api_type}
                                 size="small" color="info" variant="outlined"
                             />
+                        )}
+                        {uploadedTestcases && (
+                            <Chip label={`Using edited file · ${uploadedTestcases.length} row(s)`} size="small" color="warning" variant="outlined" />
                         )}
                     </Box>
                     <Typography variant="body2" color="text.secondary">{result.document_name} — {result.method} {result.api_url}</Typography>
@@ -767,7 +917,7 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
                         variant="contained"
                         size="small"
                         onClick={handleRunAll}
-                        disabled={running || baseTestcases.length === 0}
+                        disabled={running || activeSourceTestcases.length === 0}
                         startIcon={running ? <CircularProgress size={14} color="inherit" /> : <AutoAwesome />}
                         sx={{ background: 'linear-gradient(135deg, #1aa7d1 0%, #1f3c88 100%)', textTransform: 'none', fontWeight: 600 }}
                     >
@@ -789,6 +939,31 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
 
             {runError && <Alert severity="error" sx={{ mb: 2 }}>{runError}</Alert>}
             {evalError && <Alert severity="error" sx={{ mb: 2 }}>{evalError}</Alert>}
+
+            {/* ── Download → edit → re-upload, as an alternative to running the generated test cases as-is ── */}
+            <Box sx={{ mb: 2, p: 2, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: '#fafafa' }}>
+                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                    Need to tweak the test data before hitting the API?
+                </Typography>
+                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                    Download the generated test cases as Excel, edit them locally, then upload the edited file to run
+                    against those instead — or just click <strong>Run All Testcases</strong> above to run them as-is.
+                </Typography>
+                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <Button variant="outlined" size="small" startIcon={<Download />} onClick={() => setDownloadDialogOpen(true)} disabled={activeSourceTestcases.length === 0}>
+                        Download Test Cases for Editing
+                    </Button>
+                    <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUploadEditedFile} />
+                    <Button variant="outlined" size="small" startIcon={<CloudUploadOutlined />} onClick={() => fileInputRef.current?.click()}>
+                        Upload Edited Testcases
+                    </Button>
+                    {uploadedTestcases && (
+                        <Button size="small" color="inherit" onClick={handleDiscardUpload}>Discard, use generated test cases</Button>
+                    )}
+                </Box>
+                {uploadError && <Alert severity="error" sx={{ mt: 1.5 }}>{uploadError}</Alert>}
+            </Box>
+
             {!hasRun && (
                 <Alert severity="info" sx={{ mb: 2 }}>
                     Click <strong>Run All Testcases</strong> first to capture actual responses, then <strong>Run Automation</strong> to get Pass/Fail verdicts.
@@ -857,13 +1032,13 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
                                                             whiteSpace: 'pre-wrap',
                                                             wordBreak: 'break-word',
                                                             overflowWrap: 'anywhere',
-                                                            maxHeight: (h === 'Actual_Response' || h === 'Test Data') ? 220 : 'none',
-                                                            overflowY: (h === 'Actual_Response' || h === 'Test Data') ? 'auto' : 'visible',
+                                                            maxHeight: SCROLLABLE_CELL_COLUMNS.has(h) ? 220 : 'none',
+                                                            overflowY: SCROLLABLE_CELL_COLUMNS.has(h) ? 'auto' : 'visible',
                                                             color: h === 'Actual_Response' && /^(ERROR|GATEWAY ERROR)/.test(String((r as any)[h])) ? '#c62828' : 'inherit',
                                                             fontWeight: h === 'Actual_Response' && /^(ERROR|GATEWAY ERROR)/.test(String((r as any)[h])) ? 600 : 400,
                                                         }}
                                                     >
-                                                        {(r as any)[h] || (h === 'Actual_Response' && hasRun ? '—' : '')}
+                                                        {(r as any)[h] || (SCROLLABLE_CELL_COLUMNS.has(h) && h !== 'Test Data' && hasRun ? '—' : '')}
                                                     </Box>
                                                 )}
                                             </td>
@@ -886,6 +1061,37 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
                 <Button variant="contained" startIcon={<Download />} onClick={downloadJSON} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download JSON</Button>
                 <Button variant="contained" startIcon={<Download />} onClick={downloadExcel} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download Excel</Button>
             </Box>
+
+            <Dialog open={downloadDialogOpen} onClose={() => setDownloadDialogOpen(false)} maxWidth="sm" fullWidth>
+                <DialogTitle>Before you download</DialogTitle>
+                <DialogContent>
+                    <Typography variant="body2" sx={{ mb: 1.5 }}>
+                        This downloads the current test cases (not yet run) as an Excel file you can edit and
+                        re-upload. Please make changes carefully:
+                    </Typography>
+                    <Box component="ul" sx={{ pl: 2.5, mb: 0 }}>
+                        <Typography component="li" variant="body2" sx={{ mb: 0.5 }}>
+                            Don't rename, remove, or reorder columns — they're matched by header name.
+                        </Typography>
+                        <Typography component="li" variant="body2" sx={{ mb: 0.5 }}>
+                            <strong>Test Data</strong> must stay valid JSON after editing.
+                        </Typography>
+                        <Typography component="li" variant="body2" sx={{ mb: 0.5 }}>
+                            If you change a value inside <strong>Test Data</strong> (the payload), also update{' '}
+                            <strong>Test Case Description</strong> for that row, so it still describes what's
+                            actually being tested.
+                        </Typography>
+                        <Typography component="li" variant="body2">
+                            Leave <strong>Test Case ID</strong> unchanged unless you mean to — it's used to match
+                            results back to each row.
+                        </Typography>
+                    </Box>
+                </DialogContent>
+                <DialogActions>
+                    <Button onClick={() => setDownloadDialogOpen(false)}>Cancel</Button>
+                    <Button variant="contained" onClick={doDownloadForEditing} startIcon={<Download />}>Download</Button>
+                </DialogActions>
+            </Dialog>
         </Box>
     );
 };
@@ -1496,15 +1702,19 @@ const SidebarUpload: React.FC<{
 // ============================================================================
 // LOADING SKELETON
 // ============================================================================
-const LoadingSkeleton: React.FC = () => (
+const LoadingSkeleton: React.FC<{ mode?: GenerationMode | null }> = ({ mode }) => (
     <Box>
         <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 3 }}><Skeleton variant="text" width={200} height={40} /><Skeleton variant="rectangular" width={100} height={32} /></Box>
         <Box sx={{ display: 'flex', gap: 2, mb: 3 }}>{[0,1,2].map(i => <Skeleton key={i} variant="rectangular" width="33%" height={80} sx={{ borderRadius: 1.5 }} />)}</Box>
         <Skeleton variant="rectangular" width="100%" height={400} sx={{ borderRadius: 1, mb: 2 }} />
         <Box sx={{ textAlign: 'center', mt: 4 }}>
-            <Typography variant="h6" color="text.secondary">Generating test cases…</Typography>
+            <Typography variant="h6" color="text.secondary">
+                {mode === 'api' ? 'Generating API test cases…' : 'Generating test cases…'}
+            </Typography>
             <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
-                Extracting pages · Detecting structure · Retrieving RAG context · Generating per page · Removing duplicates.
+                {mode === 'api'
+                    ? 'Reading payload fields · Applying validation rules · Building positive & negative cases · Assigning reference numbers.'
+                    : 'Extracting pages · Detecting structure · Retrieving RAG context · Generating per page · Removing duplicates.'}
             </Typography>
         </Box>
     </Box>
@@ -2498,7 +2708,7 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
                 <Box sx={{ flex: 1, p: 3, overflowY: 'auto', transition: isResizing ? 'none' : 'all 0.3s ease' }}>
                     <Box sx={{ bgcolor: '#F4FCFF', border: '1px solid #1aa7d1', borderRadius: 2, height: '100%', p: 3 }}>
                         {loading || apiLoading ? (
-                            <LoadingSkeleton />
+                            <LoadingSkeleton mode={loading ? 'document' : 'api'} />
                         ) : mode === null ? (
                             <ModeSelector onSelect={setMode} />
                         ) : mode === 'document' ? (
