@@ -9,6 +9,7 @@ Changes vs original:
 """
 import logging
 import uuid as uuid_lib
+import asyncio
 from datetime import timedelta, datetime, timezone
 from typing import Annotated
 from dotenv import load_dotenv
@@ -29,6 +30,7 @@ from api.config.security import (
     check_rate_limit, record_failed_attempt, clear_failed_attempts,
     blacklist_token, SECRET_KEY, ALLOWED_ALGORITHMS,
 )
+from api.utils.executors import AUTH_POOL
 from api.model import (
     User, UserCreate, UserResponse, Token, LoginRequest,
     UserCreateByAdmin, UserUpdateByAdmin, PasswordUpdateByAdmin, ChangePasswordRequest,
@@ -72,6 +74,20 @@ def _user_jwt_payload(user: User, jti: str) -> dict:
     }
 
 
+# ── Password hashing/verification off the event loop ────────────────────────
+# argon2 is intentionally slow/memory-hard (that's what makes it resistant to
+# brute-forcing) — routing it through AUTH_POOL means a burst of logins or
+# password changes queues briefly on a bounded thread pool instead of each
+# one freezing the whole app (single event loop, single worker — see
+# api/utils/executors.py for why).
+async def _hash_password_async(password: str) -> str:
+    return await asyncio.get_event_loop().run_in_executor(AUTH_POOL, get_password_hash, password)
+
+
+async def _authenticate_user_async(username: str, password: str, session: Session):
+    return await asyncio.get_event_loop().run_in_executor(AUTH_POOL, authenticate_user, username, password, session)
+
+
 # ── Register ───────────────────────────────────────────────────────────────────
 @user_management_router.post("/register", response_model=UserResponse)
 async def register(user_data: UserCreate, session: SessionDep):
@@ -86,7 +102,7 @@ async def register(user_data: UserCreate, session: SessionDep):
             last_name=user_data.last_name,
             username=user_data.username.lower(),
             email=user_data.email,
-            password=get_password_hash(user_data.password),
+            password=await _hash_password_async(user_data.password),
             departmentid=user_data.departmentid,
             role="user",
             is_active=1,
@@ -115,7 +131,7 @@ async def login(login_data: LoginRequest, request: Request, response: Response, 
         check_rate_limit(username_key, session)
         check_rate_limit(ip_key, session)
 
-        user = authenticate_user(login_data.username, login_data.password, session)
+        user = await _authenticate_user_async(login_data.username, login_data.password, session)
         if not user:
             record_failed_attempt(username_key, session)
             record_failed_attempt(ip_key, session)
@@ -214,7 +230,7 @@ async def change_password(
     current_user: Annotated[User, Depends(get_current_active_user)],
 ):
     try:
-        current_user.password           = get_password_hash(password_data.new_password)
+        current_user.password           = await _hash_password_async(password_data.new_password)
         current_user.must_change_password = False
         current_user.updated_at         = datetime.now(timezone.utc)
         session.add(current_user)
@@ -277,7 +293,7 @@ async def create_user_by_admin(
         db_user = User(
             first_name=user_data.first_name, last_name=user_data.last_name,
             username=user_data.username, email=user_data.email,
-            password=get_password_hash(user_data.password),
+            password=await _hash_password_async(user_data.password),
             departmentid=user_data.departmentid,
             role=user_data.role, is_active=user_data.is_active,
             disabled=False if user_data.is_active == 1 else True,
@@ -358,7 +374,7 @@ async def update_user_password_by_admin(
         user = session.exec(select(User).where(User.username == username)).first()
         if not user:
             raise HTTPException(404, "User not found")
-        user.password           = get_password_hash(password_data.new_password)
+        user.password           = await _hash_password_async(password_data.new_password)
         user.must_change_password = True
         user.login_count        = 0
         user.updated_at         = datetime.now(timezone.utc)
