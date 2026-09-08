@@ -929,7 +929,7 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
                         onClick={handleRunAutomation}
                         disabled={evaluating || !hasRun}
                         startIcon={evaluating ? <CircularProgress size={14} color="inherit" /> : <AutoAwesome />}
-                        sx={{ background: 'linear-gradient(135deg, #2e7d32 0%, #1b5e20 100%)', textTransform: 'none', fontWeight: 600 }}
+                        sx={{ background: 'linear-gradient(135deg, #1aa7d1 0%, #1f3c88 100%)', textTransform: 'none', fontWeight: 600 }}
                     >
                         {evaluating ? 'Evaluating…' : hasEvaluated ? 'Re-run Automation' : 'Run Automation'}
                     </Button>
@@ -940,29 +940,35 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
             {runError && <Alert severity="error" sx={{ mb: 2 }}>{runError}</Alert>}
             {evalError && <Alert severity="error" sx={{ mb: 2 }}>{evalError}</Alert>}
 
-            {/* ── Download → edit → re-upload, as an alternative to running the generated test cases as-is ── */}
-            <Box sx={{ mb: 2, p: 2, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: '#fafafa' }}>
-                <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
-                    Need to tweak the test data before hitting the API?
-                </Typography>
-                <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
-                    Download the generated test cases as Excel, edit them locally, then upload the edited file to run
-                    against those instead — or just click <strong>Run All Testcases</strong> above to run them as-is.
-                </Typography>
-                <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
-                    <Button variant="outlined" size="small" startIcon={<Download />} onClick={() => setDownloadDialogOpen(true)} disabled={activeSourceTestcases.length === 0}>
-                        Download Test Cases for Editing
-                    </Button>
-                    <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUploadEditedFile} />
-                    <Button variant="outlined" size="small" startIcon={<CloudUploadOutlined />} onClick={() => fileInputRef.current?.click()}>
-                        Upload Edited Testcases
-                    </Button>
-                    {uploadedTestcases && (
-                        <Button size="small" color="inherit" onClick={handleDiscardUpload}>Discard, use generated test cases</Button>
-                    )}
+            {/* ── Download → edit → re-upload, as an alternative to running the generated
+                 test cases as-is. Only relevant BEFORE a run — once actual responses have
+                 been captured, editing the pre-run payload no longer applies, so this whole
+                 section (and its own download button) disappears in favor of the full-results
+                 Download JSON / Download Excel buttons below. ── */}
+            {!hasRun && (
+                <Box sx={{ mb: 2, p: 2, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: '#fafafa' }}>
+                    <Typography variant="body2" sx={{ fontWeight: 600, mb: 0.5 }}>
+                        Need to tweak the test data before hitting the API?
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1.5 }}>
+                        Download the generated test cases as Excel, edit them locally, then upload the edited file to run
+                        against those instead — or just click <strong>Run All Testcases</strong> above to run them as-is.
+                    </Typography>
+                    <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', alignItems: 'center' }}>
+                        <Button variant="outlined" size="small" startIcon={<Download />} onClick={() => setDownloadDialogOpen(true)} disabled={activeSourceTestcases.length === 0}>
+                            Download Test Cases for Editing
+                        </Button>
+                        <input type="file" accept=".xlsx,.xls" ref={fileInputRef} style={{ display: 'none' }} onChange={handleUploadEditedFile} />
+                        <Button variant="outlined" size="small" startIcon={<CloudUploadOutlined />} onClick={() => fileInputRef.current?.click()}>
+                            Upload Edited Testcases
+                        </Button>
+                        {uploadedTestcases && (
+                            <Button size="small" color="inherit" onClick={handleDiscardUpload}>Discard, use generated test cases</Button>
+                        )}
+                    </Box>
+                    {uploadError && <Alert severity="error" sx={{ mt: 1.5 }}>{uploadError}</Alert>}
                 </Box>
-                {uploadError && <Alert severity="error" sx={{ mt: 1.5 }}>{uploadError}</Alert>}
-            </Box>
+            )}
 
             {!hasRun && (
                 <Alert severity="info" sx={{ mb: 2 }}>
@@ -1057,10 +1063,15 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
                 </Box>
             )}
 
-            <Box sx={{ display: 'flex', gap: 2, mt: 3 }}>
-                <Button variant="contained" startIcon={<Download />} onClick={downloadJSON} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download JSON</Button>
-                <Button variant="contained" startIcon={<Download />} onClick={downloadExcel} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download Excel</Button>
-            </Box>
+            {/* Full-results downloads — shown only once there are actual results to
+                include (before that, "Download Test Cases for Editing" above is the
+                one and only download option, so the two never overlap on screen). */}
+            {hasRun && (
+                <Box sx={{ display: 'flex', gap: 2, mt: 3 }}>
+                    <Button variant="contained" startIcon={<Download />} onClick={downloadJSON} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download JSON</Button>
+                    <Button variant="contained" startIcon={<Download />} onClick={downloadExcel} fullWidth size="small" sx={{ backgroundColor: '#1976d2' }}>Download Excel</Button>
+                </Box>
+            )}
 
             <Dialog open={downloadDialogOpen} onClose={() => setDownloadDialogOpen(false)} maxWidth="sm" fullWidth>
                 <DialogTitle>Before you download</DialogTitle>
@@ -2706,7 +2717,7 @@ const MainApp: React.FC<{ user: User; onLogout: () => void }> = ({ user, onLogou
 
                 {/* ── Main content ── */}
                 <Box sx={{ flex: 1, p: 3, overflowY: 'auto', transition: isResizing ? 'none' : 'all 0.3s ease' }}>
-                    <Box sx={{ bgcolor: '#F4FCFF', border: '1px solid #1aa7d1', borderRadius: 2, height: '100%', p: 3 }}>
+                    <Box sx={{ bgcolor: '#F4FCFF', border: '1px solid #1aa7d1', borderRadius: 2, minHeight: '100%', p: 3 }}>
                         {loading || apiLoading ? (
                             <LoadingSkeleton mode={loading ? 'document' : 'api'} />
                         ) : mode === null ? (
