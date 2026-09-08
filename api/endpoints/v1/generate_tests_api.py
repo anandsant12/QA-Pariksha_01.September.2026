@@ -9,9 +9,12 @@ Endpoints:
   POST /generate-testcases      — Generate test cases (RAG pipeline, testcase_client from user JWT)
 """
 import asyncio
+import functools
 from concurrent.futures import ThreadPoolExecutor
 
 from httpcore import request
+
+from api.utils.executors import LLM_WORK_POOL, EIS_CALL_POOL
 
 # Add a module-level executor for ingestion tasks
 _ingest_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ingest")
@@ -293,6 +296,243 @@ async def extract_reference_text(
 # Generate test cases — RAG pipeline, testcase_client sourced from user record
 # ============================================================================
 
+def _run_document_generation_pipeline(
+    request: TestCaseRequest,
+    current_user: User,
+    tc_type: str,
+    user_dept: str,
+    user_app: str,
+    up_prompt: Optional[str],
+    pages: list,
+    save_activity: bool,
+) -> dict:
+    """
+    Steps 7-12 of the document generation flow: per-page RAG+LLM test case
+    generation, dedup, save-to-disk, and activity-record update.
+
+    This is the CPU/LLM-heavy part of generate_testcases() below — it is
+    called via loop.run_in_executor(LLM_WORK_POOL, ...) so it runs on a
+    worker thread, off the single asyncio event loop, instead of blocking
+    every other user's request for as long as this document takes to
+    process. Everything in here (LLM calls, ChromaDB/RAG retrieval, file and
+    DB writes) is blocking, synchronous work with no async equivalent —
+    that's expected and fine on a worker thread; it would only be a problem
+    running directly on the event loop.
+    """
+    from api.utils.rag_utils import should_skip_page, is_continuation_page
+
+    all_testcases:      list  = []
+    page_results:       list  = []
+    rag_chunks_index:   dict  = {}
+    generated_scenarios: list = []   # track scenario names for cross-page dedup
+
+    # Pre-merge continuation pages so requirements are never split across LLM calls
+    merged_pages: list = []
+    skip_next = False
+    for idx, page in enumerate(pages):
+        if skip_next:
+            skip_next = False
+            continue
+        prev_text = pages[idx - 1]["complete_text"] if idx > 0 else ""
+        if idx > 0 and is_continuation_page(page["complete_text"], prev_text):
+            if merged_pages:
+                last = merged_pages[-1]
+                last["complete_text"] = (
+                    last["complete_text"] + "\n\n" + page["complete_text"]
+                )
+                last["merged"] = True
+                print(f"   🔗 Page {page['page_number']} merged into page {last['page_number']} (continuation)")
+                skip_next = False
+                continue
+        merged_pages.append(dict(page))
+
+    print(f"\n📋 Pages after continuation merge: {len(merged_pages)} (was {len(pages)})")
+
+    for idx, page in enumerate(merged_pages):
+        pn        = page["page_number"]
+        page_text = page["complete_text"]
+
+        print(f"\n{'─'*55}")
+        print(f"🔄 Page {pn}/{len(merged_pages)}  |  extracted chars={len(page_text)}")
+
+        # Step A — pre-filter boilerplate (zero LLM cost)
+        skip, skip_reason = should_skip_page(page_text)
+        if skip:
+            print(f"   ⏭  Skipped: {skip_reason}")
+            page_results.append({
+                "page_number": pn, "testcases": [],
+                "status": "skipped", "error": skip_reason,
+            })
+            continue
+
+        # Step B — detect structure (zero LLM cost, pure regex)
+        page_meta = detect_page_structure(page_text)
+        print(f"   section_type={page_meta['section_type']} "
+              f"| tx={page_meta['transaction_codes']} "
+              f"| screens={page_meta['screen_numbers']}")
+
+        # Step C — build context window (prev_tail + next_head) SEPARATE from page_text
+        prev_tail = ""
+        if idx > 0:
+            prev_full = merged_pages[idx - 1]["complete_text"]
+            if prev_full.strip():
+                prev_tail = (
+                    f"[Previous page {merged_pages[idx-1]['page_number']} — tail]:\n"
+                    f"{prev_full[-600:].strip()}"
+                )
+        next_head = ""
+        if idx < len(merged_pages) - 1:
+            next_full = merged_pages[idx + 1]["complete_text"]
+            if next_full.strip():
+                next_head = (
+                    f"[Next page {merged_pages[idx+1]['page_number']} — head]:\n"
+                    f"{next_full[:400].strip()}"
+                )
+        context_window = "\n\n".join(filter(None, [prev_tail, next_head]))
+
+        # Step D — enriched RAG query using structural metadata
+        rag_query_parts = [page_text]
+        if page_meta["transaction_codes"]:
+            rag_query_parts.append("Transaction codes: " + ", ".join(page_meta["transaction_codes"]))
+        if page_meta["screen_numbers"]:
+            rag_query_parts.append("Screen numbers: " + ", ".join(page_meta["screen_numbers"]))
+        rag_query_parts.append(f"Section type: {page_meta['section_type']}")
+        rag_query = " ".join(rag_query_parts)
+
+        # RAG retrieval — strictly scoped to user's department/application.
+        # Returns [] automatically if no documents are ingested for this scope.
+        rag_chunks = retrieve_rag_chunks_for_page(
+            rag_query,
+            top_k            = PAGE_RAG_TOP_K,
+            doc_ids          = None,
+            department_id    = user_dept,
+            application_name = user_app,
+        )
+        for c in rag_chunks:
+            key = c["text"]
+            if key not in rag_chunks_index:
+                rag_chunks_index[key] = c
+
+        # Step E — generate with SEPARATED concerns:
+        #   page_text       → source for generation
+        #   context_window  → reading context only (passed separately)
+        #   already_covered → prevents regenerating covered scenarios
+        result = generate_testcases_for_page_rag(
+            page_number                     = pn,
+            page_text                       = page_text.strip(),
+            document_name                   = request.document_name,
+            rag_chunks                      = rag_chunks,
+            user_prompt                     = up_prompt,
+            testcase_type                   = tc_type,
+            page_metadata                   = page_meta,
+            prompt_file_content             = None,
+            selected_department_description = None,
+            department_id                   = user_dept,
+            context_window                  = context_window,
+            already_covered                 = list(generated_scenarios),
+            selected_checkboxes             = request.selected_checkboxes or [],   # NEW
+        )
+
+        page_results.append(result)
+        if result["status"] == "success":
+            all_testcases.extend(result["testcases"])
+            for tc in result["testcases"]:
+                sn = tc.get("Scenario Name") or tc.get("Sub Function Description", "")
+                if sn and sn not in generated_scenarios:
+                    generated_scenarios.append(sn)
+
+    successful = sum(1 for r in page_results if r["status"] == "success")
+    skipped    = sum(1 for r in page_results if r["status"] == "skipped")
+    failed_pg  = sum(1 for r in page_results if r["status"] == "failed")
+
+    print(f"\n{'='*55}")
+    print(f"✅ Generation done. Pages={len(pages)} "
+          f"Success={successful} Skipped={skipped} Failed={failed_pg}")
+    print(f"   Total testcases before dedup: {len(all_testcases)}")
+
+    # ── 8. Build result structure ─────────────────────────────────────────
+    result_obj = {
+        "document_name"   : request.document_name,
+        "uuid"            : request.uuid,
+        "testcase_client" : tc_type,
+        "summary"         : {
+            "total_pages_processed"  : len(pages),
+            "successful_generations" : successful,
+            "failed_generations"     : failed_pg,
+            "skipped_generations"    : skipped,
+            "total_testcase_count"   : len(all_testcases),
+        },
+        "combined_testcases": all_testcases,
+        "page_summary"    : [
+            {
+                "page_number"    : r["page_number"],
+                "status"         : r["status"],
+                "testcases_count": len(r.get("testcases", [])),
+                "error"          : r.get("error", ""),
+            }
+            for r in page_results
+        ],
+        "rag_chunks_used" : list(rag_chunks_index.values()),
+    }
+
+    if not all_testcases:
+        print("⚠ No test cases generated — skipping duplicate removal.")
+    else:
+        print("\n🔄 Running duplicate removal…")
+        result_obj = process_and_clean_testcases(result_obj)
+
+    # ── 9. Move to completed ──────────────────────────────────────────────
+    move_file_to_status(request.uuid, COMPLETED_DIR)
+
+    # ── 10. Save output to file ───────────────────────────────────────────
+    output_file_path = save_output_to_file(
+        result          = result_obj,
+        username        = current_user.username,
+        document_name   = request.document_name,
+        uuid            = request.uuid,
+        testcase_client = tc_type,
+    )
+    print(f"Output saved to: {output_file_path}")
+
+    # ── 11. Update activity record ────────────────────────────────────────
+    if save_activity:
+        from api.config.database import engine
+        from api.model import UserActivity
+        from sqlmodel import Session
+        from sqlmodel import select as _select
+
+        try:
+            with Session(engine) as db_session:
+                activity = db_session.exec(
+                    _select(UserActivity).where(UserActivity.uuid == request.uuid)
+                ).first()
+                if activity:
+                    activity.generation_completed    = True
+                    activity.generation_completed_at = datetime.now(timezone.utc)
+                    activity.output_file_path        = output_file_path
+                    activity.total_pages_processed   = (
+                        result_obj.get("summary", {}).get("total_pages_processed", 0)
+                    )
+                    activity.successful_generations  = (
+                        result_obj.get("summary", {}).get("successful_generations", 0)
+                    )
+                    activity.failed_generations      = (
+                        result_obj.get("summary", {}).get("failed_generations", 0)
+                    )
+                    activity.updated_at = datetime.now(timezone.utc)
+                    db_session.add(activity)
+                    db_session.commit()
+                    print("Activity record updated with completion details.")
+        except Exception as db_error:
+            print(f"Warning: failed to update activity record: {db_error}")
+
+    # ── 12. Cleanup ───────────────────────────────────────────────────────
+    delete_file_record(request.uuid)
+
+    result_obj["output_file_path"] = output_file_path
+    return result_obj
+
+
 @testcase_router.post("/generate-testcases")
 async def generate_testcases(
     request: TestCaseRequest,
@@ -417,12 +657,16 @@ async def generate_testcases(
         up_prompt = (request.user_prompt or "").strip() or None
 
         # ── 6. Extract pages (4-pass: logo detection, text, OCR, assemble) ───
+        #    Runs in the bounded LLM_WORK_POOL (not the default executor) —
+        #    OCR/image processing is CPU+memory heavy, so it shares the same
+        #    cap as the rest of the LLM/RAG pipeline below rather than being
+        #    able to spawn extra, uncapped concurrency of its own.
         print("\n🔍 Extracting pages with image support…")
         import asyncio as _asyncio
         try:
             pages = await _asyncio.wait_for(
                 _asyncio.get_event_loop().run_in_executor(
-                    None, extract_pages_with_images, file_bytes, filename
+                    LLM_WORK_POOL, extract_pages_with_images, file_bytes, filename
                 ),
                 timeout=90000,  # 150 min max for extraction
             )
@@ -437,218 +681,18 @@ async def generate_testcases(
             move_file_to_status(request.uuid, FAILED_DIR)
             raise HTTPException(422, "No content could be extracted from the document.")
 
-        # ── 7. Structure-aware generation ──────────────────────────────────────
-        from api.utils.rag_utils import should_skip_page, is_continuation_page
-
-        all_testcases:      list  = []
-        page_results:       list  = []
-        rag_chunks_index:   dict  = {}
-        generated_scenarios: list = []   # track scenario names for cross-page dedup
-
-        # Pre-merge continuation pages so requirements are never split across LLM calls
-        merged_pages: list = []
-        skip_next = False
-        for idx, page in enumerate(pages):
-            if skip_next:
-                skip_next = False
-                continue
-            prev_text = pages[idx - 1]["complete_text"] if idx > 0 else ""
-            if idx > 0 and is_continuation_page(page["complete_text"], prev_text):
-                if merged_pages:
-                    last = merged_pages[-1]
-                    last["complete_text"] = (
-                        last["complete_text"] + "\n\n" + page["complete_text"]
-                    )
-                    last["merged"] = True
-                    print(f"   🔗 Page {page['page_number']} merged into page {last['page_number']} (continuation)")
-                    skip_next = False
-                    continue
-            merged_pages.append(dict(page))
-
-        print(f"\n📋 Pages after continuation merge: {len(merged_pages)} (was {len(pages)})")
-
-        for idx, page in enumerate(merged_pages):
-            pn        = page["page_number"]
-            page_text = page["complete_text"]
-
-            print(f"\n{'─'*55}")
-            print(f"🔄 Page {pn}/{len(merged_pages)}  |  extracted chars={len(page_text)}")
-
-            # Step A — pre-filter boilerplate (zero LLM cost)
-            skip, skip_reason = should_skip_page(page_text)
-            if skip:
-                print(f"   ⏭  Skipped: {skip_reason}")
-                page_results.append({
-                    "page_number": pn, "testcases": [],
-                    "status": "skipped", "error": skip_reason,
-                })
-                continue
-
-            # Step B — detect structure (zero LLM cost, pure regex)
-            page_meta = detect_page_structure(page_text)
-            print(f"   section_type={page_meta['section_type']} "
-                  f"| tx={page_meta['transaction_codes']} "
-                  f"| screens={page_meta['screen_numbers']}")
-
-            # Step C — build context window (prev_tail + next_head) SEPARATE from page_text
-            prev_tail = ""
-            if idx > 0:
-                prev_full = merged_pages[idx - 1]["complete_text"]
-                if prev_full.strip():
-                    prev_tail = (
-                        f"[Previous page {merged_pages[idx-1]['page_number']} — tail]:\n"
-                        f"{prev_full[-600:].strip()}"
-                    )
-            next_head = ""
-            if idx < len(merged_pages) - 1:
-                next_full = merged_pages[idx + 1]["complete_text"]
-                if next_full.strip():
-                    next_head = (
-                        f"[Next page {merged_pages[idx+1]['page_number']} — head]:\n"
-                        f"{next_full[:400].strip()}"
-                    )
-            context_window = "\n\n".join(filter(None, [prev_tail, next_head]))
-
-            # Step D — enriched RAG query using structural metadata
-            rag_query_parts = [page_text]
-            if page_meta["transaction_codes"]:
-                rag_query_parts.append("Transaction codes: " + ", ".join(page_meta["transaction_codes"]))
-            if page_meta["screen_numbers"]:
-                rag_query_parts.append("Screen numbers: " + ", ".join(page_meta["screen_numbers"]))
-            rag_query_parts.append(f"Section type: {page_meta['section_type']}")
-            rag_query = " ".join(rag_query_parts)
-
-            # RAG retrieval — strictly scoped to user's department/application.
-            # Returns [] automatically if no documents are ingested for this scope.
-            rag_chunks = retrieve_rag_chunks_for_page(
-                rag_query,
-                top_k            = PAGE_RAG_TOP_K,
-                doc_ids          = None,
-                department_id    = user_dept,
-                application_name = user_app,
-            )
-            for c in rag_chunks:
-                key = c["text"]
-                if key not in rag_chunks_index:
-                    rag_chunks_index[key] = c
-
-            # Step E — generate with SEPARATED concerns:
-            #   page_text       → source for generation
-            #   context_window  → reading context only (passed separately)
-            #   already_covered → prevents regenerating covered scenarios
-            result = generate_testcases_for_page_rag(
-                page_number                     = pn,
-                page_text                       = page_text.strip(),
-                document_name                   = request.document_name,
-                rag_chunks                      = rag_chunks,
-                user_prompt                     = up_prompt,
-                testcase_type                   = tc_type,
-                page_metadata                   = page_meta,
-                prompt_file_content             = None,
-                selected_department_description = None,
-                department_id                   = user_dept,
-                context_window                  = context_window,
-                already_covered                 = list(generated_scenarios),
-                selected_checkboxes             = request.selected_checkboxes or [],   # NEW
-            )
-
-            page_results.append(result)
-            if result["status"] == "success":
-                all_testcases.extend(result["testcases"])
-                for tc in result["testcases"]:
-                    sn = tc.get("Scenario Name") or tc.get("Sub Function Description", "")
-                    if sn and sn not in generated_scenarios:
-                        generated_scenarios.append(sn)
-
-        successful = sum(1 for r in page_results if r["status"] == "success")
-        skipped    = sum(1 for r in page_results if r["status"] == "skipped")
-        failed_pg  = sum(1 for r in page_results if r["status"] == "failed")
-
-        print(f"\n{'='*55}")
-        print(f"✅ Generation done. Pages={len(pages)} "
-              f"Success={successful} Skipped={skipped} Failed={failed_pg}")
-        print(f"   Total testcases before dedup: {len(all_testcases)}")
-
-        # ── 8. Build result structure ─────────────────────────────────────────
-        result_obj = {
-            "document_name"   : request.document_name,
-            "uuid"            : request.uuid,
-            "testcase_client" : tc_type,
-            "summary"         : {
-                "total_pages_processed"  : len(pages),
-                "successful_generations" : successful,
-                "failed_generations"     : failed_pg,
-                "skipped_generations"    : skipped,
-                "total_testcase_count"   : len(all_testcases),
-            },
-            "combined_testcases": all_testcases,
-            "page_summary"    : [
-                {
-                    "page_number"    : r["page_number"],
-                    "status"         : r["status"],
-                    "testcases_count": len(r.get("testcases", [])),
-                    "error"          : r.get("error", ""),
-                }
-                for r in page_results
-            ],
-            "rag_chunks_used" : list(rag_chunks_index.values()),
-        }
-
-        if not all_testcases:
-            print("⚠ No test cases generated — skipping duplicate removal.")
-        else:
-            print("\n🔄 Running duplicate removal…")
-            result_obj = process_and_clean_testcases(result_obj)
-
-        # ── 9. Move to completed ──────────────────────────────────────────────
-        move_file_to_status(request.uuid, COMPLETED_DIR)
-
-        # ── 10. Save output to file ───────────────────────────────────────────
-        output_file_path = save_output_to_file(
-            result          = result_obj,
-            username        = current_user.username,
-            document_name   = request.document_name,
-            uuid            = request.uuid,
-            testcase_client = tc_type,
+        # ── 7-12. Per-page RAG+LLM generation, dedup, save-to-disk, and
+        #    activity-record update — the CPU/LLM-heavy part of this request.
+        #    Runs in the bounded LLM_WORK_POOL (off the event loop) so this
+        #    one document doesn't freeze the app for every other user while
+        #    it's being processed — see api/utils/executors.py.
+        loop = _asyncio.get_event_loop()
+        result_obj = await loop.run_in_executor(
+            LLM_WORK_POOL,
+            _run_document_generation_pipeline,
+            request, current_user, tc_type, user_dept, user_app, up_prompt, pages, save_activity,
         )
-        print(f"Output saved to: {output_file_path}")
 
-        # ── 11. Update activity record ────────────────────────────────────────
-        if save_activity:
-            from api.config.database import engine
-            from api.model import UserActivity
-            from sqlmodel import Session
-            from sqlmodel import select as _select
-
-            try:
-                with Session(engine) as db_session:
-                    activity = db_session.exec(
-                        _select(UserActivity).where(UserActivity.uuid == request.uuid)
-                    ).first()
-                    if activity:
-                        activity.generation_completed    = True
-                        activity.generation_completed_at = datetime.now(timezone.utc)
-                        activity.output_file_path        = output_file_path
-                        activity.total_pages_processed   = (
-                            result_obj.get("summary", {}).get("total_pages_processed", 0)
-                        )
-                        activity.successful_generations  = (
-                            result_obj.get("summary", {}).get("successful_generations", 0)
-                        )
-                        activity.failed_generations      = (
-                            result_obj.get("summary", {}).get("failed_generations", 0)
-                        )
-                        activity.updated_at = datetime.now(timezone.utc)
-                        db_session.add(activity)
-                        db_session.commit()
-                        print("Activity record updated with completion details.")
-            except Exception as db_error:
-                print(f"Warning: failed to update activity record: {db_error}")
-
-        # ── 12. Cleanup ───────────────────────────────────────────────────────
-        delete_file_record(request.uuid)
-
-        result_obj["output_file_path"] = output_file_path
         return JSONResponse(content=result_obj)
 
     except HTTPException:
@@ -1115,14 +1159,23 @@ async def generate_api_testcases_endpoint(
     print(f"Requested by: {current_user.email}  testcase_client={tc_type}")
     print(f"{'='*60}\n")
 
+    # LLM calls — CPU/network-heavy, so they run in the bounded LLM_WORK_POOL
+    # (off the event loop) rather than blocking every other user's request
+    # for as long as the LLM takes to respond.
+    loop = asyncio.get_event_loop()
+
     try:
-        testcases = generate_api_testcases_via_llm(
-            api_name=spec.api_name,
-            api_url=spec.api_url,
-            method=spec.method,
-            payload=gen_payload,
-            user_prompt=user_prompt,
-            testcase_type=tc_type,
+        testcases = await loop.run_in_executor(
+            LLM_WORK_POOL,
+            functools.partial(
+                generate_api_testcases_via_llm,
+                api_name=spec.api_name,
+                api_url=spec.api_url,
+                method=spec.method,
+                payload=gen_payload,
+                user_prompt=user_prompt,
+                testcase_type=tc_type,
+            ),
         )
     except Exception as e:
         raise HTTPException(500, f"API test case generation failed: {e}")
@@ -1141,15 +1194,19 @@ async def generate_api_testcases_endpoint(
         print(f"    Generating parent-key test cases (SOURCE_ID/DESTINATION/TXN_TYPE/TXN_SUB_TYPE)…")
         try:
             eis_payload_baseline = build_eis_payload_baseline(gen_payload, headers, headers_key, body_key)
-            parent_testcases = generate_parent_field_testcases(
-                api_name=spec.api_name,
-                api_url=spec.api_url,
-                method=spec.method,
-                payload=payload_dict,
-                eis_payload_baseline=eis_payload_baseline,
-                source_id_for_rrn=source_id_value,
-                user_prompt=user_prompt,
-                testcase_type=tc_type,
+            parent_testcases = await loop.run_in_executor(
+                LLM_WORK_POOL,
+                functools.partial(
+                    generate_parent_field_testcases,
+                    api_name=spec.api_name,
+                    api_url=spec.api_url,
+                    method=spec.method,
+                    payload=payload_dict,
+                    eis_payload_baseline=eis_payload_baseline,
+                    source_id_for_rrn=source_id_value,
+                    user_prompt=user_prompt,
+                    testcase_type=tc_type,
+                ),
             )
         except Exception as e:
             raise HTTPException(500, f"Parent-key test case generation failed: {e}")
@@ -1194,6 +1251,58 @@ async def generate_api_testcases_endpoint(
     return JSONResponse(content=result_obj)
 
 
+def _run_one_api_testcase(tc: dict, api_url: str, generated_reference_number: Optional[str]) -> dict:
+    """
+    Executes ONE test case's payload against the target EIS API and returns
+    the row with Actual_Response / Encrypted_Payload / Encrypted_Response
+    attached. Synchronous, blocking (network I/O + crypto) by design — always
+    called via loop.run_in_executor(EIS_CALL_POOL, ...), never directly on
+    the event loop. See run_api_testcases_endpoint() below.
+    """
+    payload = dict(tc.get("Test Data") or {})
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+
+    url = tc.get("API_URL") or api_url
+
+    user_supplied_rrn = payload.get("REQUEST_REFERENCE_NUMBER")
+    if user_supplied_rrn:
+        rrn = user_supplied_rrn
+    else:
+        source_id = payload.get("SOURCE_ID")
+        if source_id:
+            try:
+                rrn = make_rrn(str(source_id))
+            except ValueError as e:
+                return {
+                    **tc,
+                    "Actual_Response": f"ERROR: {e}",
+                    "Encrypted_Payload": None,
+                    "Encrypted_Response": None,
+                }
+        else:
+            rrn = generated_reference_number or ""
+
+    try:
+        call_result = call_eis_api(json.dumps(payload, ensure_ascii=False), rrn, url)
+    except Exception as e:
+        call_result = {
+            "encrypted_payload": None,
+            "encrypted_response": None,
+            "actual_response": f"ERROR: {e}",
+        }
+
+    return {
+        **tc,
+        "Actual_Response": call_result["actual_response"],
+        "Encrypted_Payload": call_result["encrypted_payload"],
+        "Encrypted_Response": call_result["encrypted_response"],
+    }
+
+
 @testcase_router.post("/run-api-testcases")
 async def run_api_testcases_endpoint(
     request: RunApiTestcasesRequest,
@@ -1201,7 +1310,14 @@ async def run_api_testcases_endpoint(
 ):
     """
     Executes each generated test case's payload against the target API via the EIS
-    encrypted flow, and attaches the response under "Actual_Response" for every row.
+    encrypted flow, and attaches the response under "Actual_Response" for every row
+    — along with "Encrypted_Payload" (what was actually sent on the wire, still
+    encrypted) and "Encrypted_Response" (what came back, before decryption).
+
+    The "Test Data" a test case is executed with is whatever the caller sends —
+    this is either the originally-generated payload, or a user-downloaded /
+    hand-edited / re-uploaded version of it (the frontend renders either the same
+    way and posts them here identically).
 
     RRN resolution per test case (in order):
       1. payload["REQUEST_REFERENCE_NUMBER"] — respected as-is IF the user supplied
@@ -1212,40 +1328,28 @@ async def run_api_testcases_endpoint(
          (same "SBI"+SOURCE_ID prefix, different random suffix each time). This
          prevents "REFERENCE NUMBER NOT UNIQUE" errors when re-running or when
          many test cases call the API in the same batch.
+
+    Concurrency: test cases run concurrently (not one-at-a-time) via
+    EIS_CALL_POOL, but that pool is a fixed, bounded size shared across ALL
+    users' requests — see api/utils/executors.py. That means (a) this
+    finishes faster than a strict sequential loop would, (b) it's off the
+    event loop so it doesn't freeze the app for everyone else, AND (c) it
+    naturally caps how many calls are ever in flight against the real EIS
+    API at once, regardless of how many test cases are in this batch or how
+    many other users are running their own batches at the same moment.
     """
-    updated: list = []
-    for tc in request.testcases:
-        payload = dict(tc.get("Test Data") or {})
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except Exception:
-                payload = {}
+    loop = asyncio.get_event_loop()
+    tasks = [
+        loop.run_in_executor(
+            EIS_CALL_POOL,
+            _run_one_api_testcase,
+            tc, request.api_url, request.generated_reference_number,
+        )
+        for tc in request.testcases
+    ]
+    updated = await asyncio.gather(*tasks)
 
-        url = tc.get("API_URL") or request.api_url
-
-        user_supplied_rrn = payload.get("REQUEST_REFERENCE_NUMBER")
-        if user_supplied_rrn:
-            rrn = user_supplied_rrn
-        else:
-            source_id = payload.get("SOURCE_ID")
-            if source_id:
-                try:
-                    rrn = make_rrn(str(source_id))
-                except ValueError as e:
-                    updated.append({**tc, "Actual_Response": f"ERROR: {e}"})
-                    continue
-            else:
-                rrn = request.generated_reference_number or ""
-
-        try:
-            actual_response = call_eis_api(json.dumps(payload, ensure_ascii=False), rrn, url)
-        except Exception as e:
-            actual_response = f"ERROR: {e}"
-
-        updated.append({**tc, "Actual_Response": actual_response})
-
-    return JSONResponse(content={"testcases": updated})
+    return JSONResponse(content={"testcases": list(updated)})
 
 
 
@@ -1276,8 +1380,11 @@ async def evaluate_api_testcases_endpoint(
             f"Actual_Response yet (e.g. {missing_response[0]})."
         )
 
+    # LLM call — runs in the bounded LLM_WORK_POOL, off the event loop (see
+    # api/utils/executors.py), same reasoning as test-case generation above.
     try:
-        verdicts = evaluate_api_testcases_via_llm(request.testcases)
+        loop = asyncio.get_event_loop()
+        verdicts = await loop.run_in_executor(LLM_WORK_POOL, evaluate_api_testcases_via_llm, request.testcases)
     except Exception as e:
         raise HTTPException(500, f"Pass/Fail evaluation failed: {e}")
 
