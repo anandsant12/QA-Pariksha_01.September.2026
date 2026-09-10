@@ -12,17 +12,17 @@
 
 import React, { useState, useEffect } from 'react';
 import {
-    Box, Accordion, AccordionSummary, AccordionDetails, Typography, Button,
+    Box, Typography, Button,
     TextField, Table, TableBody, TableCell, TableContainer, TableHead,
     TableRow, Paper, IconButton, Dialog, DialogTitle, DialogContent,
     DialogActions, Alert, CircularProgress, Chip, FormControl, InputLabel,
     Select, MenuItem, TablePagination, Tooltip, FormHelperText, Divider,
-    Card, CardContent, LinearProgress,
+    Card, CardContent, LinearProgress, Tabs, Tab,
 } from '@mui/material';
 import {
-    ExpandMore, Edit, Lock, Visibility, VisibilityOff, PersonAdd,
+    Edit, Lock, Visibility, VisibilityOff, PersonAdd,
     Refresh, Search, Assessment, Close, CloudUpload, Delete, AutoAwesome,
-    Download, Person,
+    Download, Person, PersonOff, Group,
 } from '@mui/icons-material';
 import { SelectChangeEvent } from '@mui/material/Select';
 import * as XLSX from 'xlsx';
@@ -1092,8 +1092,12 @@ const InactiveUsersPanel: React.FC = () => {
     const [loading, setLoading]   = useState(false);
     const [error, setError]       = useState('');
 
+    // NEW — "Disable All" state
+    const [bulkLoading, setBulkLoading] = useState(false);
+    const [bulkMsg, setBulkMsg]         = useState('');
+
     const fetchInactive = async () => {
-        setLoading(true); setError('');
+        setLoading(true); setError(''); setBulkMsg('');
         try {
             const res = await fetch(`${API_BASE}/admin/inactive-users?days=${days}`, { credentials: 'include' });
             if (!res.ok) throw new Error((await res.json()).detail || 'Failed to fetch');
@@ -1116,9 +1120,36 @@ const InactiveUsersPanel: React.FC = () => {
         } catch (err: any) { setError(err.message); }
     };
 
+    // NEW — every fetched user that isn't already disabled
+    const pendingUsers: any[] = (data?.users || []).filter((u: any) => !u.disabled);
+
+    // NEW — disable every currently-listed, not-yet-disabled inactive user in one call
+    const disableAllUsers = async () => {
+        if (!pendingUsers.length) return;
+        if (!window.confirm(
+            `Disable ${pendingUsers.length} user(s) inactive for ${days}+ days? This can be undone later by re-activating each user individually.`
+        )) return;
+
+        setBulkLoading(true); setError(''); setBulkMsg('');
+        try {
+            const res = await fetch(`${API_BASE}/admin/users/bulk-disable`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                credentials: 'include',
+                body: JSON.stringify({ usernames: pendingUsers.map((u: any) => u.username) }),
+            });
+            if (!res.ok) throw new Error((await res.json()).detail || 'Failed to disable users');
+            const result = await res.json();
+            const skippedNote = result.skipped_self?.length ? ' (your own account was skipped)' : '';
+            setBulkMsg(`Disabled ${result.disabled_count} user(s)${skippedNote}.`);
+            fetchInactive();
+        } catch (err: any) { setError(err.message); }
+        finally { setBulkLoading(false); }
+    };
+
     return (
         <Box>
-            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 2 }}>
+            <Box sx={{ display: 'flex', gap: 2, alignItems: 'center', mb: 2, flexWrap: 'wrap' }}>
                 <FormControl size="small" sx={{ minWidth: 140 }}>
                     <InputLabel>Inactive for</InputLabel>
                     <Select value={days} label="Inactive for" onChange={e => setDays(Number(e.target.value) as 60 | 90)}>
@@ -1129,8 +1160,21 @@ const InactiveUsersPanel: React.FC = () => {
                 <Button variant="contained" onClick={fetchInactive} disabled={loading}>
                     {loading ? <CircularProgress size={20} /> : 'Check'}
                 </Button>
+                {/* NEW — Disable All */}
+                {data && (
+                    <Button
+                        variant="outlined" color="error"
+                        onClick={disableAllUsers}
+                        disabled={bulkLoading || !pendingUsers.length}
+                    >
+                        {bulkLoading
+                            ? <CircularProgress size={20} />
+                            : `Disable All${pendingUsers.length ? ` (${pendingUsers.length})` : ''}`}
+                    </Button>
+                )}
             </Box>
             {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+            {bulkMsg && <Alert severity="success" sx={{ mb: 2 }} onClose={() => setBulkMsg('')}>{bulkMsg}</Alert>}
             {data && (
                 <>
                     <Typography variant="body2" sx={{ mb: 1 }}>
@@ -1183,6 +1227,10 @@ const AdminPanel: React.FC = () => {
     const [success, setSuccess]     = useState('');
     const [page, setPage]           = useState(0);
     const [rowsPerPage, setRowsPerPage] = useState(10);
+
+    // NEW — which User Management tab is active (0=RAG KB, 1=Export Users,
+    // 2=Activity Dashboard, 3=Inactive Users, 4=Search User, 5=All Users)
+    const [subTab, setSubTab]       = useState(0);
 
     // ── Dialogs ───────────────────────────────────────────────────────────────
     const [createOpen, setCreateOpen]     = useState(false);
@@ -1382,215 +1430,191 @@ const AdminPanel: React.FC = () => {
         <Box sx={{ p: 3, bgcolor: '#F4FCFF', minHeight: '100vh' }}>
 
             {/* ════════════════════════════════════════════════════════════════
-                RAG KNOWLEDGE BASE
+                USER MANAGEMENT TOOLS — tabbed (was: stacked/nested accordions)
+                error/success sit above the tabs so they're visible no matter
+                which tab triggered them (Search User and All Users used to
+                share this alert while both being permanently on-screen)
             ════════════════════════════════════════════════════════════════ */}
-            <Card sx={{ ...ragCard, mb: 3 }}>
-                <CardContent>
-                    <Accordion defaultExpanded>
-                        <AccordionSummary expandIcon={<ExpandMore />}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                                <AutoAwesome sx={{ color: '#1aa7d1' }} />
-                                <Box>
-                                    <Typography variant="h6" sx={{ fontWeight: 600 }}>RAG Knowledge Base</Typography>
-                                    <Typography variant="caption" color="text.secondary">
-                                        Admin-only: manage reference documents for per-page test case enrichment
-                                    </Typography>
-                                </Box>
-                            </Box>
-                        </AccordionSummary>
-                        <AccordionDetails><RagKnowledgeBasePanel /></AccordionDetails>
-                    </Accordion>
-                </CardContent>
-            </Card>
-
-            {/* ════════════════════════════════════════════════════════════════
-                EXPORT USERS
-            ════════════════════════════════════════════════════════════════ */}
-            <Card sx={{ ...ragCard, mb: 3 }}>
-                <CardContent>
-                    <Accordion>
-                        <AccordionSummary expandIcon={<ExpandMore />}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                                <Download sx={{ color: '#1aa7d1' }} />
-                                <Box>
-                                    <Typography variant="h6" sx={{ fontWeight: 600 }}>Export Users</Typography>
-                                    <Typography variant="caption" color="text.secondary">
-                                        Filter, sort and download all users as Excel
-                                    </Typography>
-                                </Box>
-                            </Box>
-                        </AccordionSummary>
-                        <AccordionDetails><ExportUsersPanel /></AccordionDetails>
-                    </Accordion>
-                </CardContent>
-            </Card>
-
-            {/* ════════════════════════════════════════════════════════════════
-                ACTIVITY DASHBOARD
-            ════════════════════════════════════════════════════════════════ */}
-            <Card sx={{ ...ragCard, mb: 3 }}>
-                <CardContent>
-                    <Accordion>
-                        <AccordionSummary expandIcon={<ExpandMore />}>
-                            <Box sx={{ display: 'flex', alignItems: 'center', gap: 1.5 }}>
-                                <Assessment sx={{ color: '#1aa7d1' }} />
-                                <Box>
-                                    <Typography variant="h6" sx={{ fontWeight: 600 }}>Activity Dashboard</Typography>
-                                    <Typography variant="caption" color="text.secondary">
-                                        Date-range activity report with per-user breakdown and Excel export
-                                    </Typography>
-                                </Box>
-                            </Box>
-                        </AccordionSummary>
-                        <AccordionDetails><ActivityDashboardPanel /></AccordionDetails>
-                    </Accordion>
-                </CardContent>
-            </Card>
-            
-            {/* ════════════════════════════════════════════════════════════════
-                ACTIVITY DASHBOARD
-            ════════════════════════════════════════════════════════════════ */}
-            <Card sx={{ ...ragCard, mb: 3 }}>
-                <CardContent>
-                    <Accordion sx={{ mt: 2 }}>
-                        <AccordionSummary expandIcon={<ExpandMore />}>
-                            <Typography variant="h6" sx={{ fontWeight: 600 }}>Inactive Users</Typography>
-                        </AccordionSummary>
-                        <AccordionDetails><InactiveUsersPanel /></AccordionDetails>
-                    </Accordion>    
-                </CardContent>
-            </Card>
-            
-            {/* ════════════════════════════════════════════════════════════════
-                SEARCH USER
-            ════════════════════════════════════════════════════════════════ */}
-            <Card sx={{ ...ragCard, mb: 3 }}>
-                <CardContent>
-                    <Typography variant="h6" sx={{ fontWeight: 600, mb: 2 }}>Search User</Typography>
-                    <Box sx={{ display: 'flex', gap: 2 }}>
-                        <TextField
-                            label="Username" value={searchUsername}
-                            onChange={e => setSearchUsername(e.target.value)}
-                            variant="outlined" size="small" sx={{ flex: 1 }}
-                            onKeyPress={e => { if (e.key === 'Enter' && searchUsername) fetchUserByUsername(searchUsername); }}
-                        />
-                        <Button
-                            sx={primaryBtnSx}
-                            startIcon={searchLoading ? <CircularProgress size={20} /> : <Search />}
-                            onClick={() => fetchUserByUsername(searchUsername)}
-                            disabled={!searchUsername || searchLoading}
-                        >
-                            Search
-                        </Button>
-                        <Button
-                            variant="outlined"
-                            startIcon={activityLoading ? <CircularProgress size={20} /> : <Assessment />}
-                            onClick={() => searchUsername && fetchUserActivity(searchUsername)}
-                            disabled={!searchUsername || activityLoading}
-                        >
-                            View Activity
-                        </Button>
-                    </Box>
-                </CardContent>
-            </Card>
-
-            {/* ════════════════════════════════════════════════════════════════
-                ALL USERS TABLE
-            ════════════════════════════════════════════════════════════════ */}
-            <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
-                <Typography variant="h5" sx={{ fontWeight: 600 }}>All Users</Typography>
-                <Box sx={{ display: 'flex', gap: 2 }}>
-                    <Button variant="outlined" startIcon={<Refresh />} onClick={fetchUsers} disabled={loading}>
-                        Refresh
-                    </Button>
-                    <Button sx={primaryBtnSx} startIcon={<PersonAdd />} onClick={() => setCreateOpen(true)}>
-                        Create User
-                    </Button>
-                </Box>
-            </Box>
-
             {error   && <Alert severity="error"   onClose={() => setError('')}   sx={{ mb: 2 }}>{error}</Alert>}
             {success && <Alert severity="success" onClose={() => setSuccess('')} sx={{ mb: 2 }}>{success}</Alert>}
 
-            {loading && !users.length ? (
-                <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}><CircularProgress /></Box>
-            ) : (
-                <>
-                    <TableContainer component={Paper} sx={{ mb: 2, border: '1px solid #1aa7d1', borderRadius: 3, boxShadow: '0 6px 18px rgba(26,167,209,0.12)' }}>
-                        <Table>
-                            <TableHead>
-                                <TableRow sx={{ bgcolor: '#22409A' }}>
-                                    {['Name', 'Username', 'Email', 'Department', 'Role', 'Test Env', 'Application', 'Status', 'Actions'].map(h => (
-                                        <TableCell key={h} sx={{ color: 'white', fontWeight: 600 }}>{h}</TableCell>
-                                    ))}
-                                </TableRow>
-                            </TableHead>
-                            <TableBody>
-                                {users.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map(u => (
-                                    <TableRow key={u.id} hover>
-                                        <TableCell>{u.first_name} {u.last_name}</TableCell>
-                                        <TableCell>{u.username}</TableCell>
-                                        <TableCell>{u.email}</TableCell>
-                                        <TableCell>{u.departmentid || '—'}</TableCell>
-                                        <TableCell>
-                                            <Chip label={u.role.toUpperCase()} color={u.role === 'admin' ? 'secondary' : 'default'} size="small" />
-                                        </TableCell>
-                                        <TableCell>
-                                            <Chip
-                                                label={u.testcase_client || 'UAT'} size="small" variant="outlined"
-                                                color={(u.testcase_client || 'UAT') === 'SIT' ? 'secondary' : 'success'}
-                                                sx={{ fontWeight: 600 }}
-                                            />
-                                        </TableCell>
-                                        <TableCell>
-                                            <Typography variant="caption">{u.application_name || '—'}</Typography>
-                                        </TableCell>
-                                        <TableCell>
-                                            <Chip
-                                                label={u.is_active === 1 ? 'Active' : 'Inactive'}
-                                                color={u.is_active === 1 ? 'success' : 'error'} size="small"
-                                            />
-                                        </TableCell>
-                                        <TableCell>
-                                            <Tooltip title="View Details">
-                                                <IconButton size="small" color="info"
-                                                    onClick={() => { setSelectedUser(u); setDetailsOpen(true); }}>
-                                                    <Visibility fontSize="small" />
-                                                </IconButton>
-                                            </Tooltip>
-                                            <Tooltip title="View Activity">
-                                                <IconButton size="small" color="info"
-                                                    onClick={() => fetchUserActivity(u.username)}>
-                                                    <Assessment fontSize="small" />
-                                                </IconButton>
-                                            </Tooltip>
-                                            <Tooltip title="Edit User">
-                                                <IconButton size="small" color="primary" onClick={() => openEdit(u)}>
-                                                    <Edit fontSize="small" />
-                                                </IconButton>
-                                            </Tooltip>
-                                            <Tooltip title="Change Password">
-                                                <IconButton size="small" color="primary" onClick={() => openPwd(u)}>
-                                                    <Lock fontSize="small" />
-                                                </IconButton>
-                                            </Tooltip>
-                                        </TableCell>
-                                    </TableRow>
-                                ))}
-                            </TableBody>
-                        </Table>
-                    </TableContainer>
-                    <TablePagination
-                        rowsPerPageOptions={[5, 10, 25, 50]}
-                        component="div"
-                        count={users.length}
-                        rowsPerPage={rowsPerPage}
-                        page={page}
-                        onPageChange={(_, np) => setPage(np)}
-                        onRowsPerPageChange={e => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }}
-                    />
-                </>
-            )}
+            <Card sx={{ ...ragCard, mb: 3 }}>
+                <Tabs
+                    value={subTab}
+                    onChange={(_, v) => setSubTab(v)}
+                    variant="scrollable"
+                    scrollButtons="auto"
+                    sx={{
+                        borderBottom: '1px solid #e3f6fb',
+                        px: 1,
+                        '& .MuiTab-root': { textTransform: 'none', fontWeight: 600, minHeight: 56 },
+                        '& .Mui-selected': { color: '#1aa7d1' },
+                        '& .MuiTabs-indicator': { backgroundColor: '#1aa7d1', height: 3 },
+                    }}
+                >
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><AutoAwesome fontSize="small" />RAG Knowledge Base</Box>} />
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Download fontSize="small" />Export Users</Box>} />
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Assessment fontSize="small" />Activity Dashboard</Box>} />
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><PersonOff fontSize="small" />Inactive Users</Box>} />
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Search fontSize="small" />Search User</Box>} />
+                    <Tab label={<Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}><Group fontSize="small" />All Users</Box>} />
+                </Tabs>
+
+                <CardContent>
+                    {/* RAG KNOWLEDGE BASE — kept mounted (display:none when inactive) so
+                        switching tabs never re-triggers a fetch or loses in-progress state */}
+                    <Box sx={{ display: subTab === 0 ? 'block' : 'none' }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                            Admin-only: manage reference documents for per-page test case enrichment
+                        </Typography>
+                        <RagKnowledgeBasePanel />
+                    </Box>
+
+                    {/* EXPORT USERS */}
+                    <Box sx={{ display: subTab === 1 ? 'block' : 'none' }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                            Filter, sort and download all users as Excel
+                        </Typography>
+                        <ExportUsersPanel />
+                    </Box>
+
+                    {/* ACTIVITY DASHBOARD */}
+                    <Box sx={{ display: subTab === 2 ? 'block' : 'none' }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 2 }}>
+                            Date-range activity report with per-user breakdown and Excel export
+                        </Typography>
+                        <ActivityDashboardPanel />
+                    </Box>
+
+                    {/* INACTIVE USERS */}
+                    <Box sx={{ display: subTab === 3 ? 'block' : 'none' }}>
+                        <InactiveUsersPanel />
+                    </Box>
+
+                    {/* SEARCH USER */}
+                    <Box sx={{ display: subTab === 4 ? 'block' : 'none' }}>
+                        <Box sx={{ display: 'flex', gap: 2 }}>
+                            <TextField
+                                label="Username" value={searchUsername}
+                                onChange={e => setSearchUsername(e.target.value)}
+                                variant="outlined" size="small" sx={{ flex: 1 }}
+                                onKeyPress={e => { if (e.key === 'Enter' && searchUsername) fetchUserByUsername(searchUsername); }}
+                            />
+                            <Button
+                                sx={primaryBtnSx}
+                                startIcon={searchLoading ? <CircularProgress size={20} /> : <Search />}
+                                onClick={() => fetchUserByUsername(searchUsername)}
+                                disabled={!searchUsername || searchLoading}
+                            >
+                                Search
+                            </Button>
+                            <Button
+                                variant="outlined"
+                                startIcon={activityLoading ? <CircularProgress size={20} /> : <Assessment />}
+                                onClick={() => searchUsername && fetchUserActivity(searchUsername)}
+                                disabled={!searchUsername || activityLoading}
+                            >
+                                View Activity
+                            </Button>
+                        </Box>
+                    </Box>
+
+                    {/* ALL USERS TABLE */}
+                    <Box sx={{ display: subTab === 5 ? 'block' : 'none' }}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                            <Typography variant="h5" sx={{ fontWeight: 600 }}>All Users</Typography>
+                            <Box sx={{ display: 'flex', gap: 2 }}>
+                                <Button variant="outlined" startIcon={<Refresh />} onClick={fetchUsers} disabled={loading}>
+                                    Refresh
+                                </Button>
+                                <Button sx={primaryBtnSx} startIcon={<PersonAdd />} onClick={() => setCreateOpen(true)}>
+                                    Create User
+                                </Button>
+                            </Box>
+                        </Box>
+
+                        {loading && !users.length ? (
+                            <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}><CircularProgress /></Box>
+                        ) : (
+                            <>
+                                <TableContainer component={Paper} sx={{ mb: 2, border: '1px solid #1aa7d1', borderRadius: 3, boxShadow: '0 6px 18px rgba(26,167,209,0.12)' }}>
+                                    <Table>
+                                        <TableHead>
+                                            <TableRow sx={{ bgcolor: '#22409A' }}>
+                                                {['Name', 'Username', 'Email', 'Department', 'Role', 'Test Env', 'Application', 'Status', 'Actions'].map(h => (
+                                                    <TableCell key={h} sx={{ color: 'white', fontWeight: 600 }}>{h}</TableCell>
+                                                ))}
+                                            </TableRow>
+                                        </TableHead>
+                                        <TableBody>
+                                            {users.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage).map(u => (
+                                                <TableRow key={u.id} hover>
+                                                    <TableCell>{u.first_name} {u.last_name}</TableCell>
+                                                    <TableCell>{u.username}</TableCell>
+                                                    <TableCell>{u.email}</TableCell>
+                                                    <TableCell>{u.departmentid || '—'}</TableCell>
+                                                    <TableCell>
+                                                        <Chip label={u.role.toUpperCase()} color={u.role === 'admin' ? 'secondary' : 'default'} size="small" />
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <Chip
+                                                            label={u.testcase_client || 'UAT'} size="small" variant="outlined"
+                                                            color={(u.testcase_client || 'UAT') === 'SIT' ? 'secondary' : 'success'}
+                                                            sx={{ fontWeight: 600 }}
+                                                        />
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <Typography variant="caption">{u.application_name || '—'}</Typography>
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <Chip
+                                                            label={u.is_active === 1 ? 'Active' : 'Inactive'}
+                                                            color={u.is_active === 1 ? 'success' : 'error'} size="small"
+                                                        />
+                                                    </TableCell>
+                                                    <TableCell>
+                                                        <Tooltip title="View Details">
+                                                            <IconButton size="small" color="info"
+                                                                onClick={() => { setSelectedUser(u); setDetailsOpen(true); }}>
+                                                                <Visibility fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                        <Tooltip title="View Activity">
+                                                            <IconButton size="small" color="info"
+                                                                onClick={() => fetchUserActivity(u.username)}>
+                                                                <Assessment fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                        <Tooltip title="Edit User">
+                                                            <IconButton size="small" color="primary" onClick={() => openEdit(u)}>
+                                                                <Edit fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                        <Tooltip title="Change Password">
+                                                            <IconButton size="small" color="primary" onClick={() => openPwd(u)}>
+                                                                <Lock fontSize="small" />
+                                                            </IconButton>
+                                                        </Tooltip>
+                                                    </TableCell>
+                                                </TableRow>
+                                            ))}
+                                        </TableBody>
+                                    </Table>
+                                </TableContainer>
+                                <TablePagination
+                                    rowsPerPageOptions={[5, 10, 25, 50]}
+                                    component="div"
+                                    count={users.length}
+                                    rowsPerPage={rowsPerPage}
+                                    page={page}
+                                    onPageChange={(_, np) => setPage(np)}
+                                    onRowsPerPageChange={e => { setRowsPerPage(parseInt(e.target.value, 10)); setPage(0); }}
+                                />
+                            </>
+                        )}
+                    </Box>
+                </CardContent>
+            </Card>
 
             {/* ════════════════════════════════════════════════════════════════
                 USER DETAILS DIALOG
