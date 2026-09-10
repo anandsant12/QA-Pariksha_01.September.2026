@@ -529,6 +529,7 @@ async def list_all_users_by_admin(
                     "login_count": u.login_count or 0,
                     "last_login": u.last_login.isoformat() if u.last_login else None,
                     "created_at": u.created_at.isoformat() if u.created_at else "",
+                    "updated_at": u.updated_at.isoformat() if u.updated_at else "",
                 }
                 for u in users
             ],
