@@ -34,6 +34,7 @@ from api.utils.executors import AUTH_POOL
 from api.model import (
     User, UserCreate, UserResponse, Token, LoginRequest,
     UserCreateByAdmin, UserUpdateByAdmin, PasswordUpdateByAdmin, ChangePasswordRequest,
+    BulkDisableRequest,
 )
 
 logger     = logging.getLogger(__name__)
@@ -447,6 +448,59 @@ async def get_inactive_users(
             for u in inactive
         ],
     }
+
+
+@user_management_router.patch("/admin/users/bulk-disable", include_in_schema=False)
+async def bulk_disable_users_by_admin(
+    payload: BulkDisableRequest,
+    session: SessionDep,
+    admin_user: Annotated[User, Depends(get_current_admin_user)],
+):
+    """
+    Disable many users in a single request/DB transaction — used by the
+    "Disable All" button on the Inactive Users panel so that disabling, say,
+    100 inactive accounts doesn't mean 100 separate round trips from the
+    frontend (this app runs a single Uvicorn worker, see executors.py).
+    """
+    try:
+        usernames = list(dict.fromkeys(payload.usernames))  # de-dupe, keep order
+        if not usernames:
+            raise HTTPException(400, "No usernames provided")
+
+        now = datetime.now(timezone.utc)
+        disabled, already_disabled, skipped_self, not_found = [], [], [], []
+
+        for username in usernames:
+            if username == admin_user.username:
+                skipped_self.append(username)
+                continue
+            user = session.exec(select(User).where(User.username == username)).first()
+            if not user:
+                not_found.append(username)
+                continue
+            if user.is_active == 0 and user.disabled:
+                already_disabled.append(username)
+                continue
+            user.is_active = 0
+            user.disabled  = True
+            user.updated_at = now
+            session.add(user)
+            disabled.append(username)
+
+        session.commit()
+        logger.info(f"Admin {admin_user.username} bulk-disabled {len(disabled)} user(s)")
+        return {
+            "disabled_count"   : len(disabled),
+            "disabled"         : disabled,
+            "already_disabled" : already_disabled,
+            "skipped_self"     : skipped_self,
+            "not_found"        : not_found,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(500, str(e))
 
 
 @user_management_router.get("/admin/users-list", include_in_schema=False)
