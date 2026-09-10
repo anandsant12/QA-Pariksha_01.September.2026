@@ -113,6 +113,10 @@ class PasswordUpdateByAdmin(BaseModel):
     new_password: str
 
 
+class BulkDisableRequest(BaseModel):
+    usernames: list[str]
+
+
 class ForgotPasswordRequest(BaseModel):
     email: str
 
