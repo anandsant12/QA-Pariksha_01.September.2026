@@ -54,6 +54,7 @@ class UserResponse(UserBase):
     login_count: int
     last_login: Optional[datetime] = None 
     created_at: datetime
+    updated_at: datetime
 
 
 # ============================================================================
