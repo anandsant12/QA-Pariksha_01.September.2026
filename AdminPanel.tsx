@@ -1422,7 +1422,11 @@ const AdminPanel: React.FC = () => {
     };
 
     const openPwd = (u: User) => { setSelectedUser(u); setPwdOpen(true); };
-    const formatDate = (d: string) => new Date(d).toLocaleString();
+    const formatDate = (d?: string | null) => {
+        if (!d) return 'Not available';
+        const parsed = new Date(d);
+        return isNaN(parsed.getTime()) ? 'Not available' : parsed.toLocaleString();
+    };
 
     // ── Render ────────────────────────────────────────────────────────────────
 
