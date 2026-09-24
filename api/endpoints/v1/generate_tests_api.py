@@ -1086,6 +1086,33 @@ from api.utils.api_testcase_utils import (
 #   exact same processing — only EIS_PAYLOAD's inner fields are exercised by the LLM.
 SUPPORTED_API_TYPES = {"EIS", "EIS_CHANNEL", "EIS_MICROSERVICES"}
 WRAPPED_API_TYPES = {"EIS_CHANNEL", "EIS_MICROSERVICES"}
+# Printed once at startup — lets you confirm from the server console that THIS
+# version of the file is the one actually running.
+print(f"[generate_tests_api] API types enabled: {', '.join(sorted(SUPPORTED_API_TYPES))}")
+
+
+def _normalize_eis_call_result(result) -> dict:
+    """
+    call_eis_api() returns a dict {actual_response, encrypted_payload,
+    encrypted_response} in the current eis_api_utils.py, but a plain string in
+    older copies. Accept both so a file-version mismatch can never again put a
+    whole dict into Actual_Response ("[object Object]" in the UI) or leave the
+    Encrypted_* columns blank.
+    """
+    if isinstance(result, dict):
+        actual = result.get("actual_response", "")
+        if not isinstance(actual, str):
+            actual = json.dumps(actual, indent=2, ensure_ascii=False)
+        return {
+            "actual_response": actual,
+            "encrypted_payload": result.get("encrypted_payload"),
+            "encrypted_response": result.get("encrypted_response"),
+        }
+    return {
+        "actual_response": "" if result is None else str(result),
+        "encrypted_payload": None,
+        "encrypted_response": None,
+    }
 
 @testcase_router.post("/generate-api-testcases")
 async def generate_api_testcases_endpoint(
@@ -1259,12 +1286,14 @@ def _run_one_api_testcase(tc: dict, api_url: str, generated_reference_number: Op
     called via loop.run_in_executor(EIS_CALL_POOL, ...), never directly on
     the event loop. See run_api_testcases_endpoint() below.
     """
-    payload = dict(tc.get("Test Data") or {})
-    if isinstance(payload, str):
+    # FIX: parse string Test Data BEFORE dict() — dict("...") raises ValueError.
+    raw_payload = tc.get("Test Data") or {}
+    if isinstance(raw_payload, str):
         try:
-            payload = json.loads(payload)
+            raw_payload = json.loads(raw_payload)
         except Exception:
-            payload = {}
+            raw_payload = {}
+    payload = dict(raw_payload) if isinstance(raw_payload, dict) else {}
 
     url = tc.get("API_URL") or api_url
 
@@ -1287,7 +1316,9 @@ def _run_one_api_testcase(tc: dict, api_url: str, generated_reference_number: Op
             rrn = generated_reference_number or ""
 
     try:
-        call_result = call_eis_api(json.dumps(payload, ensure_ascii=False), rrn, url)
+        call_result = _normalize_eis_call_result(
+            call_eis_api(json.dumps(payload, ensure_ascii=False), rrn, url)
+        )
     except Exception as e:
         call_result = {
             "encrypted_payload": None,
