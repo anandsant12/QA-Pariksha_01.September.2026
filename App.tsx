@@ -264,7 +264,30 @@ export const runApiTestCases = async (
     });
     if (!res.ok) throw new Error((await res.json()).detail || 'Running test cases failed');
     const data = await res.json();
-    return data.testcases || [];
+    return (data.testcases || []).map(normalizeRunRow);
+};
+
+// Guards against a backend/eis_api_utils version mismatch: if call_eis_api()
+// returned its dict {actual_response, encrypted_payload, encrypted_response}
+// and it got stored whole in Actual_Response, unpack it into the 3 columns.
+export const normalizeRunRow = (tc: any): any => {
+    const ar = tc?.['Actual_Response'];
+    if (isPlainObject(ar) && ('actual_response' in ar || 'encrypted_payload' in ar || 'encrypted_response' in ar)) {
+        return {
+            ...tc,
+            'Actual_Response': ar.actual_response ?? '',
+            'Encrypted_Payload': tc['Encrypted_Payload'] ?? ar.encrypted_payload ?? null,
+            'Encrypted_Response': tc['Encrypted_Response'] ?? ar.encrypted_response ?? null,
+        };
+    }
+    return tc;
+};
+
+// Actual_Response display — never "[object Object]".
+const formatActualResponse = (val: any): string => {
+    if (val === undefined || val === null) return '';
+    if (typeof val === 'object') return JSON.stringify(val, null, 2);
+    return String(val);
 };
 
 
@@ -291,6 +314,136 @@ const ModeSelector: React.FC<{ onSelect: (m: GenerationMode) => void }> = ({ onS
                 ))}
             </Box>
         </Box>
+    </Box>
+);
+
+
+// ============================================================================
+// NESTED PAYLOAD EDITOR — renders every level of the payload with real values.
+// Handles three kinds of entries at any depth:
+//   • field spec  {value, required, validation}  → label + chips + value editor
+//                 (if value is itself an object, recurse into it — e.g. EIS_PAYLOAD)
+//   • container   plain object without "value"   → section header, recurse
+//                 (e.g. HEADERS / BODY inside EIS_PAYLOAD)
+//   • primitive   string / number / boolean       → editable text field
+//                 (e.g. static HEADERS values)
+// ============================================================================
+type PathKey = string;
+
+const isPlainObject = (v: any): boolean =>
+    v !== null && typeof v === 'object' && !Array.isArray(v);
+
+const isFieldSpec = (v: any): boolean =>
+    isPlainObject(v) && Object.prototype.hasOwnProperty.call(v, 'value');
+
+// Immutable set at a nested path.
+const setIn = (obj: any, path: PathKey[], value: any): any => {
+    if (path.length === 0) return value;
+    const [head, ...rest] = path;
+    const base = isPlainObject(obj) ? obj : {};
+    return { ...base, [head]: setIn(base[head], rest, value) };
+};
+
+// Keep the original JSON type when the user edits a value in a text box —
+// e.g. total_amt: 120 stays a number (not "120"), booleans stay booleans.
+const coerceLikeOriginal = (original: any, input: string): any => {
+    if (typeof original === 'number') {
+        const n = Number(input);
+        return input.trim() !== '' && Number.isFinite(n) ? n : input;
+    }
+    if (typeof original === 'boolean') {
+        if (input.toLowerCase() === 'true') return true;
+        if (input.toLowerCase() === 'false') return false;
+    }
+    return input;
+};
+
+const PrimitiveEditor: React.FC<{ value: any; onChange: (v: any) => void }> = ({ value, onChange }) => (
+    <TextField
+        variant="standard"
+        size="small"
+        fullWidth
+        value={value === null || value === undefined ? '' : String(value)}
+        onChange={e => onChange(coerceLikeOriginal(value, e.target.value))}
+        inputProps={{ style: { fontSize: '0.75rem' } }}
+        sx={{ mt: 0.25 }}
+    />
+);
+
+const PayloadTree: React.FC<{
+    node: Record<string, any>;
+    path: PathKey[];
+    depth: number;
+    onChange: (path: PathKey[], value: any) => void;
+}> = ({ node, path, depth, onChange }) => (
+    <Box sx={depth > 0 ? { pl: 1.25, ml: 0.5, mt: 0.75, borderLeft: '2px solid #cdeefa' } : undefined}>
+        {Object.entries(node || {}).map(([key, entry]) => {
+            const entryPath = [...path, key];
+
+            // ── Field spec: {value, required, validation} ─────────────────
+            if (isFieldSpec(entry)) {
+                const val = entry.value;
+                const isArrayVal = Array.isArray(val);
+                const isObjectVal = isPlainObject(val);
+                return (
+                    <Box key={key} sx={{ mb: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75, flexWrap: 'wrap' }}>
+                            <Typography variant="caption" sx={{ fontWeight: 600 }}>{key}</Typography>
+                            {entry.required !== false && (
+                                <Chip label="required" size="small" sx={{ height: 16, fontSize: '0.6rem' }} />
+                            )}
+                            {isArrayVal && val.length > 1 && (
+                                <Chip label={`${val.length} valid values`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
+                            )}
+                            {isObjectVal && (
+                                <Chip label={`${Object.keys(val).length} inner field(s)`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
+                            )}
+                        </Box>
+                        {isObjectVal ? (
+                            <PayloadTree node={val} path={[...entryPath, 'value']} depth={depth + 1} onChange={onChange} />
+                        ) : isArrayVal ? (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                                Values: {val.map((x: any) => (isPlainObject(x) ? JSON.stringify(x) : String(x))).join(' | ')}
+                            </Typography>
+                        ) : (
+                            <PrimitiveEditor value={val} onChange={v => onChange([...entryPath, 'value'], v)} />
+                        )}
+                        {entry.validation && (
+                            <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                                Rule: {entry.validation}
+                            </Typography>
+                        )}
+                    </Box>
+                );
+            }
+
+            // ── Container: plain object (e.g. HEADERS / BODY) ─────────────
+            if (isPlainObject(entry)) {
+                return (
+                    <Box key={key} sx={{ mb: 1 }}>
+                        <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
+                            <Typography variant="caption" sx={{ fontWeight: 700, color: '#0b7fa3' }}>{key}</Typography>
+                            <Chip label={`${Object.keys(entry).length} item(s)`} size="small" variant="outlined" sx={{ height: 16, fontSize: '0.6rem' }} />
+                        </Box>
+                        <PayloadTree node={entry} path={entryPath} depth={depth + 1} onChange={onChange} />
+                    </Box>
+                );
+            }
+
+            // ── Array or primitive directly under a container ─────────────
+            return (
+                <Box key={key} sx={{ mb: 1 }}>
+                    <Typography variant="caption" sx={{ fontWeight: 600 }}>{key}</Typography>
+                    {Array.isArray(entry) ? (
+                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                            Values: {entry.map((x: any) => (isPlainObject(x) ? JSON.stringify(x) : String(x))).join(' | ')}
+                        </Typography>
+                    ) : (
+                        <PrimitiveEditor value={entry} onChange={v => onChange(entryPath, v)} />
+                    )}
+                </Box>
+            );
+        })}
     </Box>
 );
 
@@ -343,10 +496,14 @@ const ApiJsonUpload: React.FC<{
     // Push an edit to one payload field's value back up to the parent — reuses
     // onParsed (already resets apiResult, which is correct here too: editing the
     // spec after a previous generation should invalidate that stale result).
-    const updateFieldValue = (key: string, newValue: any) => {
+    // Works at any depth: path is relative to payload, e.g.
+    //   ['DESTINATION', 'value']                               (top level)
+    //   ['EIS_PAYLOAD', 'value', 'total_amt', 'value']         (nested)
+    //   ['EIS_PAYLOAD', 'value', 'HEADERS', 'X-API-Version']  (static header)
+    const updatePayloadPath = (path: string[], newValue: any) => {
         onParsed({
             ...apiSpec!,
-            payload: { ...apiSpec!.payload, [key]: { ...apiSpec!.payload[key], value: newValue } },
+            payload: setIn(apiSpec!.payload, path, newValue),
         });
     };
 
@@ -472,50 +629,7 @@ const ApiJsonUpload: React.FC<{
                         <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mb: 1, fontStyle: 'italic' }}>
                             Values below are editable — e.g. change DESTINATION to test against a different one.
                         </Typography>
-                        {Object.entries(apiSpec.payload).map(([key, field]) => {
-                            const isArrayVal = Array.isArray(field.value);
-                            const isObjectVal = field.value !== null && typeof field.value === 'object' && !isArrayVal;
-                            return (
-                                <Box key={key} sx={{ mb: 1 }}>
-                                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 0.75 }}>
-                                        <Typography variant="caption" sx={{ fontWeight: 600 }}>{key}</Typography>
-                                        {field.required !== false && (
-                                            <Chip label="required" size="small" sx={{ height: 16, fontSize: '0.6rem' }} />
-                                        )}
-                                        {isArrayVal && field.value.length > 1 && (
-                                            <Chip label={`${field.value.length} valid values`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
-                                        )}
-                                        {isObjectVal && (
-                                            <Chip label={`${Object.keys(field.value).length} inner field(s)`} size="small" color="info" sx={{ height: 16, fontSize: '0.6rem' }} />
-                                        )}
-                                    </Box>
-                                    {isObjectVal ? (
-                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                                            Nested object — edit the JSON file to change these fields.
-                                        </Typography>
-                                    ) : isArrayVal ? (
-                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                                            Values: {field.value.map(String).join(' | ')}
-                                        </Typography>
-                                    ) : (
-                                        <TextField
-                                            variant="standard"
-                                            size="small"
-                                            fullWidth
-                                            value={field.value ?? ''}
-                                            onChange={e => updateFieldValue(key, e.target.value)}
-                                            inputProps={{ style: { fontSize: '0.75rem' } }}
-                                            sx={{ mt: 0.25 }}
-                                        />
-                                    )}
-                                    {field.validation && (
-                                        <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
-                                            Rule: {field.validation}
-                                        </Typography>
-                                    )}
-                                </Box>
-                            );
-                        })}
+                        <PayloadTree node={apiSpec.payload} path={[]} depth={0} onChange={updatePayloadPath} />
                     </Box>
                 </Box>
             )}
@@ -809,7 +923,7 @@ const ApiResultsView: React.FC<{ result: ApiTestCaseResult; onReset: () => void 
         'Test Data': typeof tc['Test Data'] === 'object' ? JSON.stringify(tc['Test Data'], null, 2) : String(tc['Test Data'] || ''),
         'Encrypted_Payload': truncateEncrypted ? formatEncryptedPreview(tc['Encrypted_Payload']) : formatEncryptedFull(tc['Encrypted_Payload']),
         'Encrypted_Response': truncateEncrypted ? formatEncryptedPreview(tc['Encrypted_Response']) : formatEncryptedFull(tc['Encrypted_Response']),
-        'Actual_Response': tc['Actual_Response'] !== undefined && tc['Actual_Response'] !== null ? String(tc['Actual_Response']) : '',
+        'Actual_Response': formatActualResponse(tc['Actual_Response']),
         'Pass_Fail': tc['Pass_Fail'] || '',
         'Remarks': tc['Remarks'] || '',
     });
