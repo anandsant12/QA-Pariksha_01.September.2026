@@ -69,44 +69,102 @@ def _get_access_token(eis_public_key, secret_key: bytes) -> str:
     return base64.b64encode(encrypted).decode("utf-8")
 
 
+# ============================================================================
+# Building blocks — shared by call_eis_api() (server-side run) and by the
+# desktop-agent endpoints in agent_api.py (/agent/eis/prepare-batch and
+# /agent/eis/decode-batch), so both paths always produce identical output.
+# ============================================================================
+
+def prepare_eis_request(payload_json: str, rrn: str) -> dict:
+    """Encrypts + signs one payload. Never raises. Returns:
+      {"error": None, "headers": {...}, "body": {DIGI_SIGN, REQUEST, REQUEST_REFERENCE_NUMBER}}
+    or, on failure, {"error": "ERROR: ...", "headers": None, "body": None}."""
+    try:
+        private_key, eis_public_key = _load_keys()
+    except Exception as e:
+        return {"error": f"ERROR: Could not load EIS keys — {e}", "headers": None, "body": None}
+
+    secret_key = _EIS_SECRET_KEY
+    try:
+        encrypted_payload_b64 = _encrypt_aes_gcm_base64(payload_json, secret_key)
+        digital_signature     = _get_digital_signature(payload_json, private_key)
+        access_token          = _get_access_token(eis_public_key, secret_key)
+    except Exception as e:
+        return {"error": f"ERROR: Encryption/signing failed — {e}", "headers": None, "body": None}
+
+    return {
+        "error": None,
+        "headers": {"Content-Type": "application/json", "AccessToken": access_token},
+        "body": {
+            "DIGI_SIGN": digital_signature,
+            "REQUEST": encrypted_payload_b64,
+            "REQUEST_REFERENCE_NUMBER": rrn,
+        },
+    }
+
+
+def decode_eis_response(req_response) -> str:
+    """Turns the raw JSON the EIS gateway returned into the "Actual_Response" text:
+    plain gateway error, decrypt failure, or "[Signature: valid|invalid]\n<pretty JSON>".
+    Never raises."""
+    if not isinstance(req_response, dict):
+        return f"GATEWAY ERROR: Unexpected response shape — {json.dumps(req_response, ensure_ascii=False)}"
+
+    # ── Gateway-level rejection: SOURCE_ID missing/invalid, malformed request,
+    #    etc. — the API returns a PLAIN, UNENCRYPTED error object with no
+    #    "RESPONSE" / "DIGI_SIGN" keys at all. Surface it directly instead of
+    #    trying (and failing) to decrypt something that isn't there.
+    if "RESPONSE" not in req_response:
+        error_code = req_response.get("ERROR_CODE", "")
+        error_desc = req_response.get("ERROR_DESCRIPTION", "")
+        if error_desc or error_code:
+            return f"GATEWAY ERROR [{error_code}]: {error_desc}"
+        # Unrecognized shape — fall back to showing the raw payload rather than
+        # a confusing decrypt-failure message.
+        return f"GATEWAY ERROR: Unexpected response shape — {json.dumps(req_response, ensure_ascii=False)}"
+
+    try:
+        _, eis_public_key = _load_keys()
+    except Exception as e:
+        return f"ERROR: Could not load EIS keys — {e}"
+
+    try:
+        decrypted_res_data = _decrypt_aes_gcm_base64(req_response["RESPONSE"], _EIS_SECRET_KEY)
+    except Exception as e:
+        return f"ERROR: Could not decrypt response — {e}"
+
+    try:
+        decoded_sign = base64.b64decode(req_response["DIGI_SIGN"])
+        h = SHA256.new(decrypted_res_data.encode("utf-8"))
+        pkcs1_15.new(eis_public_key).verify(h, decoded_sign)
+        sig_status = "valid"
+    except Exception:
+        sig_status = "invalid"
+
+    try:
+        pretty = json.dumps(json.loads(decrypted_res_data), indent=2, ensure_ascii=False)
+    except Exception:
+        pretty = decrypted_res_data
+
+    return f"[Signature: {sig_status}]\n{pretty}"
+
+
 def call_eis_api(payload_json: str, rrn: str, url: str, timeout: int = 60) -> dict:
     """AES-GCM + RSA encrypted call. Returns a dict — see module docstring for the
     three keys. "actual_response" carries decrypted, pretty-printed response text,
     a plain-text gateway error (when the API short-circuits before encrypting a
     response — e.g. missing/invalid SOURCE_ID), or a readable 'ERROR: ...' string
-    for genuine failures — never raises."""
-    try:
-        private_key, eis_public_key = _load_keys()
-    except Exception as e:
-        return {
-            "encrypted_payload": None,
-            "encrypted_response": None,
-            "actual_response": f"ERROR: Could not load EIS keys — {e}",
-        }
+    for genuine failures — never raises.
+    (Unchanged behaviour — now built from prepare_eis_request + decode_eis_response.)"""
+    prepared = prepare_eis_request(payload_json, rrn)
+    if prepared["error"]:
+        return {"encrypted_payload": None, "encrypted_response": None, "actual_response": prepared["error"]}
 
-    secret_key = _EIS_SECRET_KEY
-    try:
-        encrypted_payload_b64 = _encrypt_aes_gcm_base64(payload_json, secret_key)
-        digital_signature      = _get_digital_signature(payload_json, private_key)
-        access_token            = _get_access_token(eis_public_key, secret_key)
-    except Exception as e:
-        return {
-            "encrypted_payload": None,
-            "encrypted_response": None,
-            "actual_response": f"ERROR: Encryption/signing failed — {e}",
-        }
-
-    headers = {"Content-Type": "application/json", "AccessToken": access_token}
-    payload_data = {
-        "DIGI_SIGN": digital_signature,
-        "REQUEST": encrypted_payload_b64,
-        "REQUEST_REFERENCE_NUMBER": rrn,
-    }
     # Captured regardless of what happens next — this IS what got sent on the wire.
-    encrypted_payload = payload_data
+    encrypted_payload = prepared["body"]
 
     try:
-        response = requests.post(url, headers=headers, json=payload_data, verify=False, timeout=timeout)
+        response = requests.post(url, headers=prepared["headers"], json=prepared["body"], verify=False, timeout=timeout)
         response.raise_for_status()
     except requests.exceptions.Timeout:
         return {
@@ -132,51 +190,8 @@ def call_eis_api(payload_json: str, rrn: str, url: str, timeout: int = 60) -> di
 
     # The raw response as received on the wire, BEFORE decryption — this is what
     # the "Encrypted_Response" column shows, whatever shape it turns out to be.
-    encrypted_response = req_response
-
-    # ── Gateway-level rejection: SOURCE_ID missing/invalid, malformed request,
-    #    etc. — the API returns a PLAIN, UNENCRYPTED error object with no
-    #    "RESPONSE" / "DIGI_SIGN" keys at all. Surface it directly instead of
-    #    trying (and failing) to decrypt something that isn't there.
-    if "RESPONSE" not in req_response:
-        error_code = req_response.get("ERROR_CODE", "")
-        error_desc = req_response.get("ERROR_DESCRIPTION", "")
-        if error_desc or error_code:
-            actual_response = f"GATEWAY ERROR [{error_code}]: {error_desc}"
-        else:
-            # Unrecognized shape — fall back to showing the raw payload rather than
-            # a confusing decrypt-failure message.
-            actual_response = f"GATEWAY ERROR: Unexpected response shape — {json.dumps(req_response, ensure_ascii=False)}"
-        return {
-            "encrypted_payload": encrypted_payload,
-            "encrypted_response": encrypted_response,
-            "actual_response": actual_response,
-        }
-
-    try:
-        decrypted_res_data = _decrypt_aes_gcm_base64(req_response["RESPONSE"], secret_key)
-    except Exception as e:
-        return {
-            "encrypted_payload": encrypted_payload,
-            "encrypted_response": encrypted_response,
-            "actual_response": f"ERROR: Could not decrypt response — {e}",
-        }
-
-    try:
-        decoded_sign = base64.b64decode(req_response["DIGI_SIGN"])
-        h = SHA256.new(decrypted_res_data.encode("utf-8"))
-        pkcs1_15.new(eis_public_key).verify(h, decoded_sign)
-        sig_status = "valid"
-    except Exception:
-        sig_status = "invalid"
-
-    try:
-        pretty = json.dumps(json.loads(decrypted_res_data), indent=2, ensure_ascii=False)
-    except Exception:
-        pretty = decrypted_res_data
-
     return {
         "encrypted_payload": encrypted_payload,
-        "encrypted_response": encrypted_response,
-        "actual_response": f"[Signature: {sig_status}]\n{pretty}",
+        "encrypted_response": req_response,
+        "actual_response": decode_eis_response(req_response),
     }
