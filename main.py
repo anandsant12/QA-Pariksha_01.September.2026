@@ -152,6 +152,8 @@ from api.endpoints.v1.generate_tests_api import testcase_router
 from api.endpoints.v1.user_management_api import user_management_router
 from api.endpoints.v1.user_activity_api import user_activity_router
 from api.endpoints.v1.sso_auth_api import sso_router
+from api.endpoints.v1.agent_api import agent_router
+
 
 
 app.include_router(upload_router)
@@ -159,6 +161,7 @@ app.include_router(testcase_router)
 app.include_router(user_management_router)
 app.include_router(user_activity_router)
 app.include_router(sso_router)
+app.include_router(agent_router)
 
 
 # ============================================================================
